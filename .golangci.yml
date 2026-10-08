@@ -1,0 +1,17 @@
+# House linter config (golangci-lint v2). The linter itself is a tool
+# dependency in tools/go.mod, so its version is pinned there and CI runs the
+# same build as a local `make lint`.
+version: "2"
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - misspell
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/yaad-index/taste-machine-telegram
