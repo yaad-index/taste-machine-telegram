@@ -34,6 +34,8 @@ const (
 type sent struct {
 	chat int64
 	text string
+	// first is the text the message was sent with, before any edit.
+	first string
 }
 
 // fakeSender records messages; an edit replaces the message's text in
@@ -48,7 +50,7 @@ type fakeSender struct {
 func (f *fakeSender) Send(_ context.Context, chat int64, text string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.msgs = append(f.msgs, sent{chat, text})
+	f.msgs = append(f.msgs, sent{chat, text, text})
 	if f.fail {
 		return 0, errors.New("send failed")
 	}
@@ -225,8 +227,9 @@ func TestInvite(t *testing.T) {
 	f.bot.Handle(context.Background(), bot.Update{ChatID: member, Private: true, UserID: member, FirstName: "Newcomer", Text: "/start " + token})
 	n := f.send.count()
 	require.GreaterOrEqual(t, n, 2)
-	assert.Equal(t, sent{member, bot.MsgWelcome}, f.send.msgs[n-2])
-	assert.Equal(t, sent{admin, "Newcomer joined through an invite (user id 7). /revoke 7 removes them."}, f.send.msgs[n-1])
+	assert.Equal(t, sent{member, bot.MsgWelcome, bot.MsgWelcome}, f.send.msgs[n-2])
+	assert.Equal(t, "Newcomer joined through an invite (user id 7). /revoke 7 removes them.", f.send.msgs[n-1].text)
+	assert.Equal(t, admin, f.send.msgs[n-1].chat)
 	assert.True(t, f.store.UserAllowed(member))
 
 	assert.Equal(t, bot.MsgInviteInvalid, f.say(43, "/start "+token), "a link admits one person")
@@ -312,10 +315,18 @@ func (f *fixture) release(t *testing.T) {
 }
 
 // compiling sends text and returns the id of the "compiling…" reply.
+// The queue may already have edited the reply by the time this looks at
+// it, so it checks the text the reply was sent with.
 func (f *fixture) compiling(t *testing.T, user int64, text string) int {
 	t.Helper()
-	require.Equal(t, bot.MsgCompiling, f.say(user, text))
-	return f.send.count()
+	n := f.send.count()
+	f.say(user, text)
+	f.send.mu.Lock()
+	defer f.send.mu.Unlock()
+	require.Greater(t, len(f.send.msgs), n, "no reply")
+	reply := f.send.msgs[n]
+	require.Equal(t, sent{chat: user, first: bot.MsgCompiling}, sent{chat: reply.chat, first: reply.first})
+	return n + 1
 }
 
 // settled waits until message id no longer reads "compiling…".
