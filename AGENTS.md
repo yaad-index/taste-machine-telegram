@@ -14,7 +14,10 @@ A Go service: a Telegram frontend for the taste-machine engine, which it imports
 - `compile`: runs the engine's `compile` command for a linked account, one compile at a time through a queue. Source-specific settings, such as a source's API key, stay with that command: it inherits this process's environment, less the bot token.
 - `flow`: the engine's question flow as chat screens (text and buttons) and what a tap on a button leads to. Button data carries a session id and a step, so a button of an answered question or an ended session is recognised.
 - `bot`: command routing, the access rules, the link commands, pick sessions in a private chat, and group sessions (`night.go`), on its own `Update` type and a `Sender`, so it is tested without the Telegram client.
-- `cmd/taste-machine-telegram`: `serve` wires the Telegram client (long polling) to `bot`; `version` prints the version.
+- `health`: the health endpoint: healthy while the update loop runs and its long polls keep succeeding.
+- `cmd/taste-machine-telegram`: `serve` wires the Telegram client (long polling) to `bot` and serves the health endpoint; `health` asks that endpoint, for the container's health check; `version` prints the version.
+
+The `Dockerfile` builds the service and installs the engine's `compile` command at the version `go.mod` pins. `.github/smoke/smoke.sh IMAGE [API_PORT] [HEALTH_PORT]` checks a built image the way CI does.
 
 ## Before pushing
 

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -23,6 +25,7 @@ import (
 	"github.com/yaad-index/taste-machine-telegram/compile"
 	"github.com/yaad-index/taste-machine-telegram/config"
 	"github.com/yaad-index/taste-machine-telegram/flow"
+	"github.com/yaad-index/taste-machine-telegram/health"
 	"github.com/yaad-index/taste-machine-telegram/userfiles"
 )
 
@@ -34,8 +37,9 @@ type env struct {
 	stdout, stderr io.Writer
 	getenv         func(string) string
 	environ        func() []string
-	// clientOptions are added to the Telegram client's options.
-	clientOptions []tgbot.Option
+	// pollTimeout is how long one long poll waits; zero means a minute.
+	// Tests shorten it.
+	pollTimeout time.Duration
 }
 
 func main() {
@@ -44,7 +48,7 @@ func main() {
 	os.Exit(run(ctx, os.Args[1:], env{stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv, environ: os.Environ}))
 }
 
-const usage = "usage: taste-machine-telegram serve | version"
+const usage = "usage: taste-machine-telegram serve | health | version"
 
 func run(ctx context.Context, args []string, e env) int {
 	if len(args) != 1 {
@@ -57,6 +61,12 @@ func run(ctx context.Context, args []string, e env) int {
 		return 0
 	case "serve":
 		if err := serve(ctx, e); err != nil {
+			_, _ = fmt.Fprintln(e.stderr, "error:", err)
+			return 1
+		}
+		return 0
+	case "health":
+		if err := health.Check(ctx, config.HealthAddr(e.getenv)); err != nil {
 			_, _ = fmt.Fprintln(e.stderr, "error:", err)
 			return 1
 		}
@@ -82,13 +92,31 @@ func serve(ctx context.Context, e env) error {
 		return err
 	}
 	files := userfiles.New(cfg.DataDir)
+	poll := e.pollTimeout
+	if poll == 0 {
+		poll = time.Minute
+	}
+	monitor := &health.Monitor{MaxAge: 3 * poll, Now: time.Now}
+	ln, err := net.Listen("tcp", cfg.Health)
+	if err != nil {
+		return fmt.Errorf("health endpoint: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle(health.Path, monitor)
+	hs := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = hs.Serve(ln) }()
+	defer func() { _ = hs.Close() }()
+
 	var b *bot.Bot
 	childEnv, secrets := compileEnv(e.environ(), cfg.Token)
 	queue := compile.NewQueue(compile.CLI{Path: cfg.Compile, Env: childEnv, Secrets: secrets}, files, store.UserAllowed,
 		func(ctx context.Context, j compile.Job, sum userfiles.Summary, err error) {
 			b.CompileDone(ctx, j, sum, err)
 		})
-	opts := append([]tgbot.Option{
+	opts := []tgbot.Option{
+		// Every request goes through the monitor, which notes each
+		// successful long poll.
+		tgbot.WithHTTPClient(poll, monitor.Wrap(&http.Client{Timeout: poll + 10*time.Second})),
 		// Handlers run on the client's workers, which Start waits for, so
 		// serve returns only after every reply in flight is done.
 		tgbot.WithNotAsyncHandlers(),
@@ -100,7 +128,10 @@ func serve(ctx context.Context, e env) error {
 		tgbot.WithErrorsHandler(func(err error) {
 			log.Error("telegram client", "err", redact(err, cfg.Token))
 		}),
-	}, e.clientOptions...)
+	}
+	if cfg.APIURL != "" {
+		opts = append(opts, tgbot.WithServerURL(cfg.APIURL))
+	}
 	client, err := tgbot.New(cfg.Token, opts...)
 	if err != nil {
 		return errors.New(redact(err, cfg.Token))
@@ -113,7 +144,9 @@ func serve(ctx context.Context, e env) error {
 	log.Info("started", "version", version, "bot", me.Username)
 	queueDone := make(chan struct{})
 	go func() { queue.Run(ctx); close(queueDone) }()
+	monitor.Running(true)
 	client.Start(ctx)
+	monitor.Running(false)
 	<-queueDone
 	return nil
 }

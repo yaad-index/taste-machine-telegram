@@ -22,10 +22,14 @@ func TestLoad(t *testing.T) {
 	assert.Equal(t, []int64{11, 22}, c.Admins)
 	assert.Equal(t, "/data", c.DataDir)
 	assert.Equal(t, config.DefaultCompile, c.Compile)
+	assert.Equal(t, config.DefaultHealth, c.Health)
+	assert.Empty(t, c.APIURL, "Telegram's own server")
 
-	c, err = config.Load(env(map[string]string{config.EnvToken: "t", config.EnvAdmins: "1", config.EnvDataDir: "/d", config.EnvCompile: "/opt/tm"}))
+	c, err = config.Load(env(map[string]string{config.EnvToken: "t", config.EnvAdmins: "1", config.EnvDataDir: "/d", config.EnvCompile: "/opt/tm", config.EnvHealth: "127.0.0.1:9", config.EnvAPIURL: "http://api.local"}))
 	require.NoError(t, err)
 	assert.Equal(t, "/opt/tm", c.Compile)
+	assert.Equal(t, "127.0.0.1:9", c.Health)
+	assert.Equal(t, "http://api.local", c.APIURL)
 }
 
 func TestLoadErrors(t *testing.T) {

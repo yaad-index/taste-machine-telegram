@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	tgbot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -74,15 +74,15 @@ type testEnv struct {
 	stdout, stderr bytes.Buffer
 	vars           map[string]string
 	environ        []string
-	options        []tgbot.Option
+	poll           time.Duration
 }
 
 func (te *testEnv) env() env {
 	return env{
 		stdout: &te.stdout, stderr: &te.stderr,
-		getenv:        func(k string) string { return te.vars[k] },
-		environ:       func() []string { return te.environ },
-		clientOptions: te.options,
+		getenv:      func(k string) string { return te.vars[k] },
+		environ:     func() []string { return te.environ },
+		pollTimeout: te.poll,
 	}
 }
 
@@ -164,8 +164,8 @@ func TestServeAnswersAnUpdate(t *testing.T) {
 	srv := httptest.NewServer(api)
 	defer srv.Close()
 	te := &testEnv{
-		vars:    map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir()},
-		options: []tgbot.Option{tgbot.WithServerURL(srv.URL), tgbot.WithHTTPClient(time.Millisecond, srv.Client())},
+		vars: map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvAPIURL: srv.URL, config.EnvHealth: "127.0.0.1:0"},
+		poll: time.Millisecond,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int)
@@ -191,8 +191,7 @@ func TestServeNeverPrintsTheToken(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	srv.Close() // a closed server: every request fails with a network error
 	te := &testEnv{
-		vars:    map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir()},
-		options: []tgbot.Option{tgbot.WithServerURL(srv.URL)},
+		vars: map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvAPIURL: srv.URL, config.EnvHealth: "127.0.0.1:0"},
 	}
 	assert.Equal(t, 1, run(context.Background(), []string{"serve"}, te.env()))
 	assert.Contains(t, te.stderr.String(), "error:")
@@ -231,11 +230,11 @@ func TestServeLinksThroughTheCompileCommand(t *testing.T) {
 	srv := httptest.NewServer(api)
 	defer srv.Close()
 	te := &testEnv{
-		vars: map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvCompile: self},
+		vars: map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvAPIURL: srv.URL, config.EnvHealth: "127.0.0.1:0", config.EnvCompile: self},
 		// The process environment as serve sees it, token included: serve
 		// must strip it before running the compile.
 		environ: []string{"FAKE_COMPILE=1", config.EnvToken + "=" + token},
-		options: []tgbot.Option{tgbot.WithServerURL(srv.URL), tgbot.WithHTTPClient(time.Millisecond, srv.Client())},
+		poll:    time.Millisecond,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int)
@@ -265,9 +264,9 @@ func TestServeWaitsForTheQueueOnShutdown(t *testing.T) {
 	srv := httptest.NewServer(api)
 	defer srv.Close()
 	te := &testEnv{
-		vars:    map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvCompile: self},
+		vars:    map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvAPIURL: srv.URL, config.EnvHealth: "127.0.0.1:0", config.EnvCompile: self},
 		environ: []string{"FAKE_COMPILE=1", "FAKE_COMPILE_SLEEP=1"},
-		options: []tgbot.Option{tgbot.WithServerURL(srv.URL), tgbot.WithHTTPClient(time.Millisecond, srv.Client())},
+		poll:    time.Millisecond,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int)
@@ -329,4 +328,51 @@ func TestKeyboard(t *testing.T) {
 		{{Text: "a", CallbackData: "x 1 o0"}},
 		{{Text: "b", CallbackData: "x 1 n"}, {Text: "c", CallbackData: "x 1 s"}},
 	}}, got)
+}
+
+// freeAddr returns a loopback address with a port nothing listens on.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+	return addr
+}
+
+// The health endpoint answers while serve runs, and the health command
+// reports what it says.
+func TestServeHealth(t *testing.T) {
+	api := &fakeAPI{replied: make(chan struct{}, 1)}
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+	addr := freeAddr(t)
+	te := &testEnv{
+		vars: map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvAPIURL: srv.URL, config.EnvHealth: addr},
+		poll: time.Millisecond,
+	}
+	check := &testEnv{vars: map[string]string{config.EnvHealth: addr}}
+	require.Equal(t, 1, run(context.Background(), []string{"health"}, check.env()), "nothing listens yet")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int)
+	go func() { done <- run(ctx, []string{"serve"}, te.env()) }()
+	require.Eventually(t, func() bool {
+		c := &testEnv{vars: map[string]string{config.EnvHealth: addr}}
+		return run(context.Background(), []string{"health"}, c.env()) == 0
+	}, 20*time.Second, 10*time.Millisecond, "healthy while polling")
+	cancel()
+	require.Equal(t, 0, <-done, te.stderr.String())
+	check = &testEnv{vars: map[string]string{config.EnvHealth: addr}}
+	assert.Equal(t, 1, run(context.Background(), []string{"health"}, check.env()), "the endpoint stops with serve")
+	assert.Contains(t, check.stderr.String(), "error:")
+}
+
+func TestServeHealthAddressInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	te := &testEnv{vars: map[string]string{config.EnvToken: token, config.EnvAdmins: "1", config.EnvDataDir: t.TempDir(), config.EnvHealth: ln.Addr().String()}}
+	assert.Equal(t, 1, run(context.Background(), []string{"serve"}, te.env()))
+	assert.Contains(t, te.stderr.String(), "health endpoint:")
 }
