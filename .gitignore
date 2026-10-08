@@ -1,0 +1,8 @@
+# Generated per clone by `make install-hooks`.
+/.githooks/
+
+# Written by `go build ./...` while the module has a single main package.
+/taste-machine-telegram
+
+# Built by `make dist`.
+/dist/

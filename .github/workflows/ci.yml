@@ -1,0 +1,56 @@
+# Build, vet, test and lint, and cross-compile the service for every release
+# platform. Runs on the pull request and on the push that lands it: a squash
+# onto a base that has moved is a combination the pull request's run never
+# covered.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Track the version pinned in go.mod so CI and the module stay in
+          # lockstep.
+          go-version-file: go.mod
+          # Key the module and build cache on both modules' go.sum: building
+          # the linter dominates a cold run.
+          cache-dependency-path: |
+            tools/go.sum
+            go.sum
+
+      - name: Check
+        # The same target a contributor runs: vet, build, race tests, formatting
+        # (gofumpt, goimports), lint and tidiness of both modules. The tools are
+        # built from tools/go.mod, so nothing is installed separately.
+        run: make check
+
+  binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Cross-compile
+        # The same target the release workflow runs, so a platform that stops
+        # building fails here rather than at release time.
+        run: make dist
