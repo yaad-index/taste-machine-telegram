@@ -21,6 +21,7 @@ import (
 	"github.com/yaad-index/taste-machine-telegram/access"
 	"github.com/yaad-index/taste-machine-telegram/bot"
 	"github.com/yaad-index/taste-machine-telegram/compile"
+	"github.com/yaad-index/taste-machine-telegram/flow"
 	"github.com/yaad-index/taste-machine-telegram/userfiles"
 )
 
@@ -32,8 +33,9 @@ const (
 )
 
 type sent struct {
-	chat int64
-	text string
+	chat    int64
+	text    string
+	buttons [][]flow.Button
 	// first is the text the message was sent with, before any edit.
 	first string
 }
@@ -44,13 +46,14 @@ type fakeSender struct {
 	mu    sync.Mutex
 	msgs  []sent
 	edits int
+	taps  []string
 	fail  bool
 }
 
 func (f *fakeSender) Send(_ context.Context, chat int64, text string) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.msgs = append(f.msgs, sent{chat, text, text})
+	f.msgs = append(f.msgs, sent{chat: chat, text: text, first: text})
 	if f.fail {
 		return 0, errors.New("send failed")
 	}
@@ -66,6 +69,37 @@ func (f *fakeSender) Edit(_ context.Context, chat int64, id int, text string) er
 	f.msgs[id-1].text = text
 	f.edits++
 	return nil
+}
+
+func (f *fakeSender) SendScreen(_ context.Context, chat int64, s flow.Screen) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.msgs = append(f.msgs, sent{chat: chat, text: s.Text, buttons: s.Buttons, first: s.Text})
+	return len(f.msgs), nil
+}
+
+func (f *fakeSender) EditScreen(_ context.Context, chat int64, id int, s flow.Screen) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id < 1 || id > len(f.msgs) || f.msgs[id-1].chat != chat {
+		return errors.New("no such message")
+	}
+	f.msgs[id-1].text, f.msgs[id-1].buttons = s.Text, s.Buttons
+	f.edits++
+	return nil
+}
+
+func (f *fakeSender) AnswerTap(_ context.Context, id, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.taps = append(f.taps, id+": "+text)
+	return nil
+}
+
+func (f *fakeSender) message(id int) sent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.msgs[id-1]
 }
 
 func (f *fakeSender) text(id int) string {
@@ -93,7 +127,7 @@ func (f *fakeSender) lastTo(chat int64, n int) string {
 	return ""
 }
 
-// fakeRunner writes a shelf of three items with two rated, after gate
+// fakeRunner writes a shelf of six items with two rated, after gate
 // lets it through when gate is set, or fails for user names in fail.
 type fakeRunner struct {
 	gate chan struct{}
@@ -114,11 +148,18 @@ func (r *fakeRunner) Run(ctx context.Context, l userfiles.Link, out string) erro
 	if r.fail[l.User] {
 		return errors.New("taste-machine: error: no such user")
 	}
-	sch := schema.Schema{Fields: []schema.Field{{Name: "theme", Type: schema.Category, Role: schema.Preference}}}
+	sch := schema.Schema{Fields: []schema.Field{
+		{Name: "theme", Type: schema.Category, Role: schema.Preference, Askable: true},
+		{Name: "name", Type: schema.Category, Role: schema.Info, Display: true},
+	}}
 	shelf := &fileformat.Catalogue{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: "s", Kind: fileformat.KindCatalogue, Schema: sch}}
 	taste := &fileformat.Taste{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: "s", Kind: fileformat.KindTaste}}
-	for i, id := range []string{"a", "b", "c"} {
-		shelf.Items = append(shelf.Items, fileformat.Item{ID: id, Facts: map[string]schema.Value{"theme": {Type: schema.Category, Category: "sea"}}})
+	for i, id := range []string{"a", "b", "c", "d", "e", "f"} {
+		theme := []string{"sea", "sea", "space", "space", "forest", "forest"}[i]
+		shelf.Items = append(shelf.Items, fileformat.Item{ID: id, Facts: map[string]schema.Value{
+			"theme": {Type: schema.Category, Category: theme},
+			"name":  {Type: schema.Category, Category: "Item " + strings.ToUpper(id)},
+		}})
 		it := fileformat.TasteItem{ID: id, Plays: 1}
 		if i < 2 {
 			rating := 7.0
@@ -227,7 +268,7 @@ func TestInvite(t *testing.T) {
 	f.bot.Handle(context.Background(), bot.Update{ChatID: member, Private: true, UserID: member, FirstName: "Newcomer", Text: "/start " + token})
 	n := f.send.count()
 	require.GreaterOrEqual(t, n, 2)
-	assert.Equal(t, sent{member, bot.MsgWelcome, bot.MsgWelcome}, f.send.msgs[n-2])
+	assert.Equal(t, sent{chat: member, text: bot.MsgWelcome, first: bot.MsgWelcome}, f.send.msgs[n-2])
 	assert.Equal(t, "Newcomer joined through an invite (user id 7). /revoke 7 removes them.", f.send.msgs[n-1].text)
 	assert.Equal(t, admin, f.send.msgs[n-1].chat)
 	assert.True(t, f.store.UserAllowed(member))
@@ -340,7 +381,7 @@ func TestLink(t *testing.T) {
 	f := newFixture(t)
 	f.admit(t, member)
 	id := f.compiling(t, member, "/link SRC some one")
-	assert.Equal(t, "Done: 3 items on your shelf, 2 of your items rated.", f.settled(t, id))
+	assert.Equal(t, "Done: 6 items on your shelf, 2 of your items rated.", f.settled(t, id))
 	l, err := f.files.Link(member)
 	require.NoError(t, err)
 	assert.Equal(t, userfiles.Link{Source: "src", User: "some one"}, l, "the source is lower-cased, the user name kept whole")
@@ -429,4 +470,104 @@ func TestRevokeDuringACompileWritesNothing(t *testing.T) {
 	assert.Contains(t, f.settled(t, id), "The compile failed")
 	_, _, err := f.files.Paths(member)
 	require.ErrorIs(t, err, userfiles.ErrNotLinked)
+}
+
+// press taps the button whose text starts with label on message id, as
+// user in their private chat, and returns the tap's notice.
+func (f *fixture) press(t *testing.T, user int64, id int, label string) string {
+	t.Helper()
+	for _, row := range f.send.message(id).buttons {
+		for _, b := range row {
+			if strings.HasPrefix(b.Text, label) {
+				return f.pressData(user, id, b.Data)
+			}
+		}
+	}
+	t.Fatalf("no button %q on message %d: %q", label, id, f.send.message(id).text)
+	return ""
+}
+
+func (f *fixture) pressData(user int64, id int, data string) string {
+	f.send.mu.Lock()
+	n := len(f.send.taps)
+	f.send.mu.Unlock()
+	f.bot.Handle(context.Background(), bot.Update{ChatID: user, Private: true, UserID: user, CallbackID: "cb", Data: data, MessageID: id})
+	f.send.mu.Lock()
+	defer f.send.mu.Unlock()
+	if len(f.send.taps) == n {
+		return "(no answer)"
+	}
+	return strings.TrimPrefix(f.send.taps[len(f.send.taps)-1], "cb: ")
+}
+
+// linked admits member and links them, so /pick has files to read.
+func (f *fixture) linked(t *testing.T) {
+	t.Helper()
+	f.admit(t, member)
+	f.settled(t, f.compiling(t, member, "/link src a"))
+}
+
+func TestPickNeedsALink(t *testing.T) {
+	f := newFixture(t)
+	f.admit(t, member)
+	assert.Equal(t, bot.MsgNotLinked, f.say(member, "/pick"))
+	assert.Contains(t, f.say(member, "/help"), "/pick")
+}
+
+func TestPickFlow(t *testing.T) {
+	f := newFixture(t)
+	f.linked(t)
+	assert.Equal(t, "theme? (6 left)", f.say(member, "/pick"))
+	q := f.send.count()
+	assert.Len(t, f.send.message(q).buttons, 5, "three options, other and no preference, show results now")
+
+	assert.Empty(t, f.press(t, member, q, "space"), "a tap is acknowledged without a notice")
+	assert.Equal(t, sent{chat: member, text: "theme: space", first: "theme? (6 left)"}, f.send.message(q), "the question is edited in place to show the answer, without buttons")
+	results := f.send.count()
+	require.Equal(t, results, q+1)
+	got := f.send.message(results)
+	assert.True(t, strings.HasPrefix(got.text, "Top picks:\n1. "), got.text)
+	assert.Contains(t, got.text, "Item C", "results carry display names")
+
+	f.press(t, member, results, "why 1")
+	assert.Equal(t, results+1, f.send.count())
+	assert.Contains(t, f.send.message(results+1).text, "score ", "the full explanation")
+}
+
+func TestPickTapRules(t *testing.T) {
+	f := newFixture(t)
+	f.linked(t)
+	f.say(member, "/pick")
+	first := f.send.count()
+	oldData := f.send.message(first).buttons[0][0].Data
+	f.press(t, member, first, "no preference")
+	assert.Equal(t, bot.MsgStaleTap, f.pressData(member, first, oldData))
+
+	f.say(member, "/pick")
+	assert.Equal(t, bot.MsgSessionEnded, f.pressData(member, first, oldData), "a new /pick replaces the session")
+
+	second := f.send.count()
+	f.now = f.now.Add(bot.SessionTTL)
+	assert.Equal(t, bot.MsgSessionEnded, f.press(t, member, second, "space"), "sessions end after SessionTTL")
+
+	assert.Equal(t, bot.MsgSessionEnded, f.pressData(member, second, "zzzz 1 o0"))
+	f.now = f.now.Add(-bot.SessionTTL)
+	f.say(member, "/pick")
+	live := f.send.count()
+	f.bot.Handle(context.Background(), bot.Update{ChatID: group, UserID: member, CallbackID: "cb", Data: f.send.message(live).buttons[0][0].Data, MessageID: live})
+	f.send.mu.Lock()
+	assert.Equal(t, "cb: "+bot.MsgSessionEnded, f.send.taps[len(f.send.taps)-1], "a private session's button does not work from a group chat")
+	f.send.mu.Unlock()
+	assert.Equal(t, bot.MsgRefused, f.pressData(42, second, "zzzz 1 o0"), "a stranger's tap is refused")
+	assert.NotContains(t, f.logs.String(), "42")
+}
+
+func TestPickSessionsEndOnRestart(t *testing.T) {
+	f := newFixture(t)
+	f.linked(t)
+	f.say(member, "/pick")
+	q := f.send.count()
+	// A new bot over the same allowlist and files, as after a restart.
+	f.bot = bot.New(bot.Deps{Access: f.store, Files: f.files, Send: f.send, Name: botName, Log: slog.New(slog.NewTextHandler(f.logs, nil)), Now: func() time.Time { return f.now }})
+	assert.Equal(t, bot.MsgSessionEnded, f.pressData(member, q, f.send.message(q).buttons[0][0].Data), "a restart forgets sessions")
 }
