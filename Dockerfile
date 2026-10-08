@@ -5,7 +5,7 @@
 
 # The build stage runs on the builder's own platform and cross-compiles,
 # so a multi-platform build needs no emulation.
-FROM --platform=$BUILDPLATFORM golang:1.26.1 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.0 AS build
 ARG TARGETOS TARGETARCH
 ENV CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH
 WORKDIR /src
