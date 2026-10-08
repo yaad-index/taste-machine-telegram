@@ -108,6 +108,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The standard OCI labels and annotations (source, revision, version,
+      # created, title, description, licenses), taken from the workflow
+      # context. The source entry is what connects the package to this
+      # repository. The run is a push to main, so the version is set to the
+      # release tag rather than derived from the ref.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          labels: |
+            org.opencontainers.image.version=${{ needs.release-please.outputs.tag_name }}
+          annotations: |
+            org.opencontainers.image.version=${{ needs.release-please.outputs.tag_name }}
+
       - name: Build and push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -115,6 +131,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: VERSION=${{ needs.release-please.outputs.tag_name }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ needs.release-please.outputs.tag_name }}
             ghcr.io/${{ github.repository }}:latest
