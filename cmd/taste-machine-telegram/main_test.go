@@ -24,6 +24,7 @@ import (
 
 	"github.com/yaad-index/taste-machine-telegram/bot"
 	"github.com/yaad-index/taste-machine-telegram/config"
+	"github.com/yaad-index/taste-machine-telegram/flow"
 )
 
 const token = "123:SECRET-TOKEN"
@@ -296,4 +297,36 @@ func TestCompileEnv(t *testing.T) {
 	}, token)
 	assert.Equal(t, []string{"PATH=/bin", "TASTE_MACHINE_SOURCE_API_KEY=k-1", "OTHER_TOKEN=t-2", "EMPTY_KEY=", "KEYBOARD=us"}, env, "everything but the bot token")
 	assert.Equal(t, []string{token, "k-1", "t-2"}, secrets)
+}
+
+func TestConvertTap(t *testing.T) {
+	msg := &models.Message{ID: 12, Chat: models.Chat{ID: 7, Type: models.ChatTypePrivate}}
+	u, ok := convert(&models.Update{CallbackQuery: &models.CallbackQuery{
+		ID: "cb1", From: models.User{ID: 7, FirstName: "Someone"}, Data: "abcd 1 o0",
+		Message: models.MaybeInaccessibleMessage{Message: msg},
+	}})
+	require.True(t, ok)
+	assert.Equal(t, bot.Update{ChatID: 7, Private: true, UserID: 7, FirstName: "Someone", CallbackID: "cb1", Data: "abcd 1 o0", MessageID: 12}, u)
+
+	u, ok = convert(&models.Update{CallbackQuery: &models.CallbackQuery{
+		ID: "cb4", From: models.User{ID: 7}, Data: "d",
+		Message: models.MaybeInaccessibleMessage{Message: &models.Message{ID: 3, Chat: models.Chat{ID: -100, Type: models.ChatTypeSupergroup}}},
+	}})
+	require.True(t, ok)
+	assert.False(t, u.Private, "a tap in a group chat")
+	assert.Equal(t, int64(-100), u.ChatID)
+
+	_, ok = convert(&models.Update{CallbackQuery: &models.CallbackQuery{ID: "cb2", From: models.User{ID: 7}}})
+	assert.False(t, ok, "a tap on a message the bot can no longer see")
+	_, ok = convert(&models.Update{CallbackQuery: &models.CallbackQuery{ID: "cb3", From: models.User{ID: 8, IsBot: true}, Message: models.MaybeInaccessibleMessage{Message: msg}}})
+	assert.False(t, ok, "a bot's tap")
+}
+
+func TestKeyboard(t *testing.T) {
+	assert.Nil(t, keyboard(flow.Screen{Text: "no buttons"}), "no keyboard, so an edit removes the buttons")
+	got := keyboard(flow.Screen{Buttons: [][]flow.Button{{{Text: "a", Data: "x 1 o0"}}, {{Text: "b", Data: "x 1 n"}, {Text: "c", Data: "x 1 s"}}}})
+	assert.Equal(t, &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{
+		{{Text: "a", CallbackData: "x 1 o0"}},
+		{{Text: "b", CallbackData: "x 1 n"}, {Text: "c", CallbackData: "x 1 s"}},
+	}}, got)
 }

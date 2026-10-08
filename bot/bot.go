@@ -5,19 +5,27 @@ package bot
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/yaad-index/taste-machine/dataset"
+	"github.com/yaad-index/taste-machine/fileformat"
+	"github.com/yaad-index/taste-machine/score"
 
 	"github.com/yaad-index/taste-machine-telegram/access"
 	"github.com/yaad-index/taste-machine-telegram/compile"
+	"github.com/yaad-index/taste-machine-telegram/flow"
 	"github.com/yaad-index/taste-machine-telegram/userfiles"
 )
 
-// Update is one incoming message.
+// Update is one incoming message, or a tap on a button.
 type Update struct {
 	ChatID int64
 	// Private is true in a one-to-one chat with the bot.
@@ -25,13 +33,24 @@ type Update struct {
 	UserID    int64
 	FirstName string
 	Text      string
+	// CallbackID is set for a tap on a button; Data is the button's data
+	// and MessageID the message the button is on.
+	CallbackID string
+	Data       string
+	MessageID  int
 }
 
-// Sender sends text messages and edits them.
+// Sender sends messages, edits them and answers taps on buttons.
 type Sender interface {
 	// Send returns the sent message's id.
 	Send(ctx context.Context, chatID int64, text string) (int, error)
 	Edit(ctx context.Context, chatID int64, messageID int, text string) error
+	// SendScreen sends a text with buttons and returns its id.
+	SendScreen(ctx context.Context, chatID int64, s flow.Screen) (int, error)
+	// EditScreen replaces a message's text and buttons.
+	EditScreen(ctx context.Context, chatID int64, messageID int, s flow.Screen) error
+	// AnswerTap acknowledges a tap, with a short notice when text is set.
+	AnswerTap(ctx context.Context, callbackID, text string) error
 }
 
 // Replies the bot sends.
@@ -54,7 +73,12 @@ const (
 	MsgAlreadyBusy     = "A compile of yours is already running; wait for it to finish."
 	MsgNothingToUnlink = "You have no linked account."
 	MsgUnlinked        = "Your account is unlinked and your files are deleted."
+	MsgSessionEnded    = "This session has ended (the bot restarted or it timed out); start again with /pick, or /night in a group."
+	MsgStaleTap        = "That question was already answered."
 )
+
+// SessionTTL is how long a pick session lasts.
+const SessionTTL = 6 * time.Hour
 
 // CompileEvery is the shortest time between two compiles of one user.
 const CompileEvery = time.Hour
@@ -74,14 +98,30 @@ type Deps struct {
 }
 
 // Bot handles updates.
-type Bot struct{ Deps }
+type Bot struct {
+	Deps
+	// solo holds each user's pick session in their private chat. Updates
+	// are handled one at a time, but the lock keeps that an assumption of
+	// the transport rather than of this package.
+	mu   sync.Mutex
+	solo map[int64]*session
+}
+
+type session struct {
+	flow    *flow.Session
+	started time.Time
+}
 
 // New returns a bot.
-func New(d Deps) *Bot { return &Bot{d} }
+func New(d Deps) *Bot { return &Bot{Deps: d, solo: map[int64]*session{}} }
 
 // Handle answers one update. Nothing about a user who is not allowed is
 // logged or stored.
 func (b *Bot) Handle(ctx context.Context, u Update) {
+	if u.CallbackID != "" {
+		b.tap(ctx, u)
+		return
+	}
 	cmd, arg, ok := b.command(u.Text)
 	if u.Private {
 		b.private(ctx, u, cmd, arg, ok)
@@ -116,6 +156,8 @@ func (b *Bot) private(ctx context.Context, u Update, cmd, arg string, isCmd bool
 		b.refresh(ctx, u)
 	case "unlink":
 		b.unlink(ctx, u)
+	case "pick":
+		b.pick(ctx, u)
 	case "allow", "disallow":
 		b.reply(ctx, u, MsgInGroupOnly)
 	default:
@@ -235,6 +277,7 @@ func (b *Bot) help(user int64) string {
 		"/link <source> <user name> compiles your shelf and taste from a source account (private chat).",
 		"/refresh compiles them again; at most once an hour (private chat).",
 		"/unlink deletes your files (private chat).",
+		"/pick asks a few questions and suggests what to pick from your shelf (private chat).",
 	}
 	if b.Access.IsAdmin(user) {
 		lines = append(lines,
@@ -316,6 +359,117 @@ func (b *Bot) unlink(ctx context.Context, u Update) {
 		return
 	}
 	b.reply(ctx, u, MsgUnlinked)
+}
+
+// pick starts a question flow on the user's own shelf, replacing any
+// session they had.
+func (b *Bot) pick(ctx context.Context, u Update) {
+	taste, err := b.load(u.UserID)
+	switch {
+	case errors.Is(err, userfiles.ErrNotLinked):
+		b.reply(ctx, u, MsgNotLinked)
+		return
+	case err != nil:
+		b.Log.Error("loading a user's files", "err", err)
+		b.reply(ctx, u, MsgSomethingFailed)
+		return
+	}
+	s := flow.New(sessionID(), taste)
+	b.mu.Lock()
+	b.solo[u.UserID] = &session{flow: s, started: b.Now()}
+	b.mu.Unlock()
+	if _, err := b.Send.SendScreen(ctx, u.ChatID, s.Start()); err != nil {
+		b.Log.Error("sending a question", "err", err)
+	}
+}
+
+// load reads the user's current files into a taste.
+func (b *Bot) load(user int64) (score.Taste, error) {
+	shelfPath, tastePath, err := b.Files.Paths(user)
+	if err != nil {
+		return nil, err
+	}
+	shelf, err := fileformat.ReadCatalogueFile(shelfPath)
+	if err != nil {
+		return nil, err
+	}
+	taste, err := fileformat.ReadTasteFile(tastePath)
+	if err != nil {
+		return nil, err
+	}
+	d, err := dataset.Load(shelf, []dataset.Input{{Taste: taste, Name: "you"}}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return score.Learn(d, d.Members[0]), nil
+}
+
+// tap handles a tap on a button: the session's flow decides what the tap
+// does, and every tap is acknowledged.
+func (b *Bot) tap(ctx context.Context, u Update) {
+	if !b.Access.UserAllowed(u.UserID) {
+		_ = b.Send.AnswerTap(ctx, u.CallbackID, MsgRefused)
+		return
+	}
+	s := b.session(u)
+	if s == nil {
+		b.answerTap(ctx, u, MsgSessionEnded)
+		return
+	}
+	reply, err := s.Tap(u.Data)
+	switch {
+	case errors.Is(err, flow.ErrStale):
+		b.answerTap(ctx, u, MsgStaleTap)
+		return
+	case err != nil:
+		b.answerTap(ctx, u, MsgSessionEnded)
+		return
+	}
+	b.answerTap(ctx, u, "")
+	if reply.Edit != nil {
+		if err := b.Send.EditScreen(ctx, u.ChatID, u.MessageID, *reply.Edit); err != nil {
+			b.Log.Error("editing a question", "err", err)
+		}
+	}
+	for _, screen := range reply.Send {
+		if _, err := b.Send.SendScreen(ctx, u.ChatID, screen); err != nil {
+			b.Log.Error("sending a screen", "err", err)
+			return
+		}
+	}
+}
+
+// session returns the user's live session, or nil when there is none: it
+// timed out or was lost to a restart. A tap on a replaced session's button
+// is turned away by the new session, whose id it does not carry.
+func (b *Bot) session(u Update) *flow.Session {
+	if !u.Private {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.solo[u.UserID]
+	if !ok {
+		return nil
+	}
+	if b.Now().Sub(s.started) >= SessionTTL {
+		delete(b.solo, u.UserID)
+		return nil
+	}
+	return s.flow
+}
+
+func (b *Bot) answerTap(ctx context.Context, u Update, text string) {
+	if err := b.Send.AnswerTap(ctx, u.CallbackID, text); err != nil {
+		b.Log.Error("answering a tap", "err", err)
+	}
+}
+
+// sessionID is a short random id that ties buttons to their session.
+func sessionID() string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func (b *Bot) edit(ctx context.Context, chat int64, msg int, text string) {

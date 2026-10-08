@@ -22,6 +22,7 @@ import (
 	"github.com/yaad-index/taste-machine-telegram/bot"
 	"github.com/yaad-index/taste-machine-telegram/compile"
 	"github.com/yaad-index/taste-machine-telegram/config"
+	"github.com/yaad-index/taste-machine-telegram/flow"
 	"github.com/yaad-index/taste-machine-telegram/userfiles"
 )
 
@@ -139,8 +140,24 @@ func compileEnv(environ []string, token string) (env, secrets []string) {
 	return env, secrets
 }
 
-// convert keeps the messages the bot answers: text from a person.
+// convert keeps the updates the bot answers: text from a person, and taps
+// on the bot's buttons.
 func convert(u *models.Update) (bot.Update, bool) {
+	if cq := u.CallbackQuery; cq != nil {
+		m := cq.Message.Message
+		if m == nil || cq.From.IsBot {
+			return bot.Update{}, false
+		}
+		return bot.Update{
+			ChatID:     m.Chat.ID,
+			Private:    m.Chat.Type == models.ChatTypePrivate,
+			UserID:     cq.From.ID,
+			FirstName:  cq.From.FirstName,
+			CallbackID: cq.ID,
+			Data:       cq.Data,
+			MessageID:  m.ID,
+		}, true
+	}
 	m := u.Message
 	if m == nil || m.From == nil || m.From.IsBot {
 		return bot.Update{}, false
@@ -167,6 +184,43 @@ func (s sender) Send(ctx context.Context, chatID int64, text string) (int, error
 func (s sender) Edit(ctx context.Context, chatID int64, messageID int, text string) error {
 	_, err := s.c.EditMessageText(ctx, &tgbot.EditMessageTextParams{ChatID: chatID, MessageID: messageID, Text: text})
 	return err
+}
+
+func (s sender) SendScreen(ctx context.Context, chatID int64, sc flow.Screen) (int, error) {
+	m, err := s.c.SendMessage(ctx, &tgbot.SendMessageParams{ChatID: chatID, Text: sc.Text, ReplyMarkup: keyboard(sc)})
+	if err != nil {
+		return 0, err
+	}
+	return m.ID, nil
+}
+
+// EditScreen replaces text and buttons; a screen without buttons removes
+// the message's buttons, since an edit without a keyboard drops it.
+func (s sender) EditScreen(ctx context.Context, chatID int64, messageID int, sc flow.Screen) error {
+	_, err := s.c.EditMessageText(ctx, &tgbot.EditMessageTextParams{ChatID: chatID, MessageID: messageID, Text: sc.Text, ReplyMarkup: keyboard(sc)})
+	return err
+}
+
+func (s sender) AnswerTap(ctx context.Context, callbackID, text string) error {
+	_, err := s.c.AnswerCallbackQuery(ctx, &tgbot.AnswerCallbackQueryParams{CallbackQueryID: callbackID, Text: text})
+	return err
+}
+
+// keyboard is a screen's buttons as an inline keyboard, or nil (no
+// keyboard at all) when it has none.
+func keyboard(sc flow.Screen) models.ReplyMarkup {
+	if len(sc.Buttons) == 0 {
+		return nil
+	}
+	rows := make([][]models.InlineKeyboardButton, 0, len(sc.Buttons))
+	for _, row := range sc.Buttons {
+		r := make([]models.InlineKeyboardButton, 0, len(row))
+		for _, b := range row {
+			r = append(r, models.InlineKeyboardButton{Text: b.Text, CallbackData: b.Data})
+		}
+		rows = append(rows, r)
+	}
+	return &models.InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
 // redact renders err with the bot token masked. The client masks it in
