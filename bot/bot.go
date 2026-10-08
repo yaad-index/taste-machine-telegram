@@ -32,6 +32,7 @@ type Update struct {
 	Private   bool
 	UserID    int64
 	FirstName string
+	Username  string
 	Text      string
 	// CallbackID is set for a tap on a button; Data is the button's data
 	// and MessageID the message the button is on.
@@ -105,6 +106,8 @@ type Bot struct {
 	// the transport rather than of this package.
 	mu   sync.Mutex
 	solo map[int64]*session
+	// nights holds each group chat's session.
+	nights map[int64]*night
 }
 
 type session struct {
@@ -113,7 +116,9 @@ type session struct {
 }
 
 // New returns a bot.
-func New(d Deps) *Bot { return &Bot{Deps: d, solo: map[int64]*session{}} }
+func New(d Deps) *Bot {
+	return &Bot{Deps: d, solo: map[int64]*session{}, nights: map[int64]*night{}}
+}
 
 // Handle answers one update. Nothing about a user who is not allowed is
 // logged or stored.
@@ -182,6 +187,12 @@ func (b *Bot) group(ctx context.Context, u Update, cmd, arg string) {
 	switch cmd {
 	case "start", "help":
 		b.reply(ctx, u, b.help(u.UserID))
+	case "night":
+		b.openNight(ctx, u)
+	case "pick":
+		b.groupPick(ctx, u)
+	case "done":
+		b.endNight(ctx, u)
 	case "invite", "revoke", "link", "refresh", "unlink":
 		b.reply(ctx, u, MsgInPrivateOnly)
 	default:
@@ -246,6 +257,7 @@ func (b *Bot) revoke(ctx context.Context, u Update, arg string) {
 		b.reply(ctx, u, fmt.Sprintf("User %d is revoked, but deleting their files failed.", id))
 		return
 	}
+	b.leaveNights(ctx, id)
 	if !found {
 		b.reply(ctx, u, fmt.Sprintf("User %d was not on the allowlist; any files they had are deleted.", id))
 		return
@@ -278,6 +290,7 @@ func (b *Bot) help(user int64) string {
 		"/refresh compiles them again; at most once an hour (private chat).",
 		"/unlink deletes your files (private chat).",
 		"/pick asks a few questions and suggests what to pick from your shelf (private chat).",
+		"/night opens a session in a group chat: members tap I'm in, then /pick asks the group, on the shelf of whoever runs it. /done ends the session.",
 	}
 	if b.Access.IsAdmin(user) {
 		lines = append(lines,
@@ -411,6 +424,14 @@ func (b *Bot) tap(ctx context.Context, u Update) {
 		_ = b.Send.AnswerTap(ctx, u.CallbackID, MsgRefused)
 		return
 	}
+	if !u.Private {
+		if !b.Access.ChatAllowed(u.ChatID) {
+			b.answerTap(ctx, u, MsgChatNotAllowed)
+			return
+		}
+		b.groupTap(ctx, u)
+		return
+	}
 	s := b.session(u)
 	if s == nil {
 		b.answerTap(ctx, u, MsgSessionEnded)
@@ -431,21 +452,13 @@ func (b *Bot) tap(ctx context.Context, u Update) {
 			b.Log.Error("editing a question", "err", err)
 		}
 	}
-	for _, screen := range reply.Send {
-		if _, err := b.Send.SendScreen(ctx, u.ChatID, screen); err != nil {
-			b.Log.Error("sending a screen", "err", err)
-			return
-		}
-	}
+	b.sendAll(ctx, u.ChatID, reply.Send)
 }
 
 // session returns the user's live session, or nil when there is none: it
 // timed out or was lost to a restart. A tap on a replaced session's button
 // is turned away by the new session, whose id it does not carry.
 func (b *Bot) session(u Update) *flow.Session {
-	if !u.Private {
-		return nil
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s, ok := b.solo[u.UserID]
