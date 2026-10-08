@@ -6,6 +6,13 @@ This file is for people and agents changing taste-machine-telegram. `README.md` 
 
 A Go service: a Telegram frontend for the taste-machine engine, which it imports as a library pinned to a released version. Design decisions are numbered Architecture Decision Records in `adr/`; read the ADR governing an area before changing that area.
 
+## Packages
+
+- `config`: the configuration, read from the environment. Errors name the variable and never print its value.
+- `access`: who may use the bot: admins from the configuration, and users and group chats on an allowlist file with one-time invites.
+- `bot`: command routing and the access rules, on its own `Update` type and a `Sender`, so it is tested without the Telegram client.
+- `cmd/taste-machine-telegram`: `serve` wires the Telegram client (long polling) to `bot`; `version` prints the version.
+
 ## Before pushing
 
 ```
