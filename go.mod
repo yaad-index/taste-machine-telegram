@@ -1,6 +1,6 @@
 module github.com/yaad-index/taste-machine-telegram
 
-go 1.26.1
+go 1.27.0
 
 require (
 	github.com/go-telegram/bot v1.27.0
