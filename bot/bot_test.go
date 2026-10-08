@@ -152,8 +152,12 @@ func (r *fakeRunner) Run(ctx context.Context, l userfiles.Link, out string) erro
 		{Name: "theme", Type: schema.Category, Role: schema.Preference, Askable: true},
 		{Name: "name", Type: schema.Category, Role: schema.Info, Display: true},
 	}}
-	shelf := &fileformat.Catalogue{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: "s", Kind: fileformat.KindCatalogue, Schema: sch}}
-	taste := &fileformat.Taste{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: "s", Kind: fileformat.KindTaste}}
+	// The source names the schema, so linking another source gives files
+	// that do not match.
+	shelf := &fileformat.Catalogue{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: l.Source, Kind: fileformat.KindCatalogue, Schema: sch}}
+	// Like the engine's compile, the taste file is labelled with the
+	// source's user name.
+	taste := &fileformat.Taste{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: l.Source, Kind: fileformat.KindTaste, Taste: &fileformat.TasteMeta{Label: l.User}}}
 	for i, id := range []string{"a", "b", "c", "d", "e", "f"} {
 		theme := []string{"sea", "sea", "space", "space", "forest", "forest"}[i]
 		shelf.Items = append(shelf.Items, fileformat.Item{ID: id, Facts: map[string]schema.Value{
@@ -552,6 +556,7 @@ func TestPickTapRules(t *testing.T) {
 
 	assert.Equal(t, bot.MsgSessionEnded, f.pressData(member, second, "zzzz 1 o0"))
 	f.now = f.now.Add(-bot.SessionTTL)
+	require.Equal(t, bot.MsgChatAllowed, f.sayInGroup(admin, "/allow"))
 	f.say(member, "/pick")
 	live := f.send.count()
 	f.bot.Handle(context.Background(), bot.Update{ChatID: group, UserID: member, CallbackID: "cb", Data: f.send.message(live).buttons[0][0].Data, MessageID: live})
@@ -570,4 +575,213 @@ func TestPickSessionsEndOnRestart(t *testing.T) {
 	// A new bot over the same allowlist and files, as after a restart.
 	f.bot = bot.New(bot.Deps{Access: f.store, Files: f.files, Send: f.send, Name: botName, Log: slog.New(slog.NewTextHandler(f.logs, nil)), Now: func() time.Time { return f.now }})
 	assert.Equal(t, bot.MsgSessionEnded, f.pressData(member, q, f.send.message(q).buttons[0][0].Data), "a restart forgets sessions")
+}
+
+const other = int64(8)
+
+// in sends text in the group chat as user with a first name and username.
+func (f *fixture) in(user int64, first, username, text string) string {
+	n := f.send.count()
+	f.bot.Handle(context.Background(), bot.Update{ChatID: group, UserID: user, FirstName: first, Username: username, Text: text})
+	return f.send.lastTo(group, n)
+}
+
+// tapIn taps a button on message id in the group chat and returns the
+// tap's notice.
+func (f *fixture) tapIn(t *testing.T, user int64, first string, id int, label string) string {
+	t.Helper()
+	for _, row := range f.send.message(id).buttons {
+		for _, b := range row {
+			if strings.HasPrefix(b.Text, label) {
+				return f.tapData(user, first, id, b.Data)
+			}
+		}
+	}
+	t.Fatalf("no button %q on message %d: %q", label, id, f.send.message(id).text)
+	return ""
+}
+
+func (f *fixture) tapData(user int64, first string, id int, data string) string {
+	f.send.mu.Lock()
+	n := len(f.send.taps)
+	f.send.mu.Unlock()
+	f.bot.Handle(context.Background(), bot.Update{ChatID: group, UserID: user, FirstName: first, CallbackID: "cb", Data: data, MessageID: id})
+	f.send.mu.Lock()
+	defer f.send.mu.Unlock()
+	if len(f.send.taps) == n {
+		return "(no answer)"
+	}
+	return strings.TrimPrefix(f.send.taps[len(f.send.taps)-1], "cb: ")
+}
+
+// night admits and links member and other, allows the group chat, opens a
+// session and returns the lobby's message id.
+func (f *fixture) night(t *testing.T) int {
+	t.Helper()
+	f.linked(t)
+	f.admit(t, other)
+	f.settled(t, f.compiling(t, other, "/link src b"))
+	require.Equal(t, bot.MsgChatAllowed, f.sayInGroup(admin, "/allow"))
+	f.in(member, "Ann", "ann", "/night")
+	return f.send.count()
+}
+
+func TestNightLobby(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	assert.Equal(t, "Tonight's session. In: nobody yet.\nTap I'm in to join; then /pick starts, on the shelf of whoever runs it.", f.send.message(lobby).text)
+	assert.Equal(t, bot.MsgNightOpen, f.in(other, "Bob", "", "/night"), "one session per chat")
+
+	assert.Equal(t, bot.MsgRefused, f.tapIn(t, 42, "Stranger", lobby, "I'm in"))
+	f.admit(t, 9)
+	assert.Equal(t, bot.MsgLinkFirst, f.tapIn(t, 9, "Cat", lobby, "I'm in"), "no files, no joining")
+	assert.Equal(t, bot.MsgJoined, f.tapIn(t, member, "Ann", lobby, "I'm in"))
+	assert.Equal(t, bot.MsgAlreadyIn, f.tapIn(t, member, "Ann", lobby, "I'm in"))
+	assert.Equal(t, bot.MsgJoined, f.tapIn(t, other, "Bob", lobby, "I'm in"))
+	assert.Contains(t, f.send.message(lobby).text, "In: Ann, Bob.", "the lobby lists who is in")
+}
+
+func TestNightRefusesAnotherSchema(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.now = f.now.Add(bot.CompileEvery)
+	f.settled(t, f.compiling(t, other, "/link elsewhere b"))
+	assert.Equal(t, bot.MsgJoined, f.tapIn(t, member, "Ann", lobby, "I'm in"))
+	assert.Equal(t, bot.MsgOtherSchema, f.tapIn(t, other, "Bob", lobby, "I'm in"))
+	assert.NotContains(t, f.send.message(lobby).text, "Bob")
+}
+
+func TestNightPick(t *testing.T) {
+	f := newFixture(t)
+	f.night(t)
+	require.Equal(t, bot.MsgNightDone, f.in(member, "Ann", "", "/done"))
+	assert.Equal(t, bot.MsgNoNight, f.in(admin, "Admin", "", "/pick"), "no session, no group pick")
+	f.in(member, "Ann", "", "/night")
+	lobby := f.send.count()
+	assert.Equal(t, bot.MsgJoinFirst, f.in(member, "Ann", "", "/pick"))
+	f.tapIn(t, member, "Ann", lobby, "I'm in")
+	f.tapIn(t, other, "Bob", lobby, "I'm in")
+
+	assert.Equal(t, "theme? (6 left)", f.in(member, "Ann", "", "/pick"))
+	q := f.send.count()
+	assert.Equal(t, bot.MsgPickRunning, f.in(other, "Bob", "", "/pick"))
+	f.admit(t, 9)
+	assert.Equal(t, bot.MsgJoinClosed, f.tapIn(t, 9, "Cat", lobby, "I'm in"))
+	assert.Equal(t, bot.MsgMembersOnly, f.tapIn(t, 9, "Cat", q, "sea"), "only members answer")
+	old := f.send.message(q).buttons[0][0].Data
+	assert.Empty(t, f.tapIn(t, other, "Bob", q, "space"))
+	assert.Equal(t, sent{chat: group, text: "theme: space (Bob)", first: "theme? (6 left)"}, f.send.message(q), "the question shows the answer and who gave it")
+	assert.Equal(t, bot.MsgStaleTap, f.tapData(member, "Ann", q, old), "the first tap counts")
+
+	results := f.send.message(f.send.count()).text
+	assert.True(t, strings.HasPrefix(results, "Top picks:\n1. "), results)
+	assert.Regexp(t, `\n    Ann -?\d\.\d{3}, Bob -?\d\.\d{3}`, results, "each member's score by first name")
+}
+
+func TestNightLabelsAreUnique(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.bot.Handle(context.Background(), bot.Update{ChatID: group, UserID: member, FirstName: "Sam", Username: "sam_a", CallbackID: "j1", Data: f.send.message(lobby).buttons[0][0].Data, MessageID: lobby})
+	f.bot.Handle(context.Background(), bot.Update{ChatID: group, UserID: other, FirstName: "Sam", CallbackID: "j2", Data: f.send.message(lobby).buttons[0][0].Data, MessageID: lobby})
+	f.in(member, "Sam", "sam_a", "/pick")
+	q := f.send.count()
+	f.tapIn(t, member, "Sam", q, "show results now")
+	results := f.send.message(f.send.count()).text
+	assert.Contains(t, results, "Sam (8) ", "no username: the id is added")
+	assert.Contains(t, results, "Sam (@sam_a) ", "the username is added")
+}
+
+func TestNightDoneAndTimeout(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.tapIn(t, member, "Ann", lobby, "I'm in")
+	assert.Equal(t, bot.MsgNightDone, f.in(member, "Ann", "", "/done"))
+	assert.Equal(t, bot.MsgSessionEnded, f.tapIn(t, other, "Bob", lobby, "I'm in"))
+	assert.Equal(t, bot.MsgNoNight, f.in(member, "Ann", "", "/done"))
+
+	f.in(member, "Ann", "", "/night")
+	fresh := f.send.count()
+	f.admit(t, 9)
+	assert.Equal(t, bot.MsgSessionEnded, f.tapIn(t, 9, "Cat", lobby, "I'm in"), "an old session's button, not this one's")
+	lobby = fresh
+	f.now = f.now.Add(bot.SessionTTL)
+	assert.Equal(t, bot.MsgSessionEnded, f.tapIn(t, other, "Bob", lobby, "I'm in"), "a session ends after SessionTTL")
+	assert.NotEqual(t, bot.MsgNightOpen, f.in(member, "Ann", "", "/night"), "and a new one can open")
+}
+
+func TestNightOneMemberIsSingleMode(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.tapIn(t, member, "Ann", lobby, "I'm in")
+	f.in(member, "Ann", "", "/pick")
+	f.tapIn(t, member, "Ann", f.send.count(), "show results now")
+	results := f.send.message(f.send.count()).text
+	assert.True(t, strings.HasPrefix(results, "Top picks:"), results)
+	assert.NotContains(t, results, "Ann ", "single mode has no member scores")
+}
+
+func TestRevokeDuringANight(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.tapIn(t, member, "Ann", lobby, "I'm in")
+	f.tapIn(t, other, "Bob", lobby, "I'm in")
+	f.say(admin, "/revoke 8")
+	assert.Contains(t, f.send.message(lobby).text, "In: Ann.", "a revoked member leaves the lobby")
+
+	f.admit(t, other)
+	f.settled(t, f.compiling(t, other, "/link src b"))
+	f.tapIn(t, other, "Bob", lobby, "I'm in")
+	f.in(member, "Ann", "", "/pick")
+	q := f.send.count()
+	f.say(admin, "/revoke 8")
+	assert.Equal(t, sent{chat: group, text: "theme? (6 left)", buttons: f.send.message(q).buttons, first: "theme? (6 left)"}, f.send.message(q), "nothing changes until the next answer")
+	f.tapIn(t, member, "Ann", q, "space")
+	next := f.send.message(f.send.count()).text
+	assert.NotContains(t, next, "Bob", "the flow moved onto the member left")
+	assert.True(t, strings.HasPrefix(next, "Top picks:"), next)
+	assert.NotContains(t, next, "Ann ", "one member left: single mode")
+}
+
+func TestRevokeTheLastMemberEndsTheNight(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.tapIn(t, member, "Ann", lobby, "I'm in")
+	f.in(member, "Ann", "", "/pick")
+	f.say(admin, "/revoke 7")
+	assert.Equal(t, bot.MsgNightNoMembers, f.send.lastTo(group, 0))
+	assert.Equal(t, bot.MsgNoNight, f.in(other, "Bob", "", "/done"))
+}
+
+func TestNightLeavesOutMembersWithoutFiles(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.tapIn(t, member, "Ann", lobby, "I'm in")
+	f.tapIn(t, other, "Bob", lobby, "I'm in")
+	require.Equal(t, bot.MsgUnlinked, f.say(other, "/unlink"))
+	text := f.in(member, "Ann", "", "/pick")
+	assert.True(t, strings.HasPrefix(text, "Left out, their files are gone: Bob.\n\ntheme? (6 left)"), text)
+}
+
+func TestNightInADisallowedChat(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	require.Equal(t, bot.MsgChatDisallowed, f.sayInGroup(admin, "/disallow"))
+	assert.Equal(t, bot.MsgChatNotAllowed, f.tapIn(t, member, "Ann", lobby, "I'm in"), "taps follow the chat's allowlist too")
+}
+
+// Results shown before a member left stay as they were: a "why" tap after
+// a revoke explains, it does not rank again.
+func TestRevokeAfterTheResults(t *testing.T) {
+	f := newFixture(t)
+	lobby := f.night(t)
+	f.tapIn(t, member, "Ann", lobby, "I'm in")
+	f.tapIn(t, other, "Bob", lobby, "I'm in")
+	f.in(member, "Ann", "", "/pick")
+	f.tapIn(t, member, "Ann", f.send.count(), "show results now")
+	results := f.send.count()
+	f.say(admin, "/revoke 8")
+	f.tapIn(t, member, "Ann", results, "why 1")
+	why := f.send.message(f.send.count()).text
+	assert.False(t, strings.HasPrefix(why, "Top picks:"), why)
+	assert.Contains(t, why, "Bob:", "the explanation of the results as shown")
 }

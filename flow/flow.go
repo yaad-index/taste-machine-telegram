@@ -51,6 +51,17 @@ type Session struct {
 	question pick.Question
 	results  []score.Result
 	done     bool
+	// log is every answer applied, with Undo as a step of its own, so the
+	// flow can be replayed over another taste.
+	log []step
+}
+
+// step is one entry of the log: an answer, an Undo of the one before, or
+// stopping for the results.
+type step struct {
+	answer pick.Answer
+	undo   bool
+	stop   bool
 }
 
 // New starts a session with the given id over a taste.
@@ -109,6 +120,13 @@ func (s *Session) finish(prefix string) Screen {
 		if pos := r.Positive(1); len(pos) > 0 {
 			fmt.Fprintf(&b, "\n    %s = %s", pos[0].Field, pos[0].Value)
 		}
+		if len(r.Members) > 0 {
+			parts := make([]string, 0, len(r.Members))
+			for _, m := range r.Members {
+				parts = append(parts, fmt.Sprintf("%s %.3f", m.Label, m.Score))
+			}
+			b.WriteString("\n    " + strings.Join(parts, ", "))
+		}
 		buttons = append(buttons, Button{Text: fmt.Sprintf("why %d", i+1), Data: s.id + " w " + strconv.Itoa(i)})
 	}
 	return Screen{Text: b.String(), Buttons: [][]Button{buttons}}
@@ -132,9 +150,11 @@ func (s *Session) Tap(data string) (Reply, error) {
 	f := s.question.Field
 	switch {
 	case act == "s":
+		s.log = append(s.log, step{stop: true})
 		return Reply{Edit: &Screen{Text: f.Name + ": (stopped)"}, Send: []Screen{s.finish("")}}, nil
 	case act == "u":
 		s.pick.Undo()
+		s.log = append(s.log, step{undo: true})
 		return Reply{Edit: &Screen{Text: "Undone; " + f.Name + " is skipped."}, Send: []Screen{s.next("")}}, nil
 	case act == "n":
 		return s.apply(pick.Answer{Field: f.Name, Kind: pick.NoPreference}, "no preference")
@@ -163,17 +183,57 @@ func (s *Session) apply(a pick.Answer, label string) (Reply, error) {
 	if err != nil {
 		return Reply{}, err
 	}
+	s.log = append(s.log, step{answer: a})
 	edit := &Screen{Text: a.Field + ": " + label}
 	if out.Empty != nil {
-		s.step++
-		return Reply{Edit: edit, Send: []Screen{{
-			Text:    report("No items left:", *out.Empty),
-			Buttons: [][]Button{{{Text: "Undo", Data: s.data("u")}}},
-		}}}, nil
+		return Reply{Edit: edit, Send: []Screen{s.emptyScreen(*out.Empty)}}, nil
 	}
 	// Options come from the items that remain, each with at least one
 	// match, so an answer from a button is never unmet.
 	return Reply{Edit: edit, Send: []Screen{s.next("")}}, nil
+}
+
+func (s *Session) emptyScreen(r score.EmptyReport) Screen {
+	s.step++
+	return Screen{
+		Text:    report("No items left:", r),
+		Buttons: [][]Button{{{Text: "Undo", Data: s.data("u")}}},
+	}
+}
+
+// Rebuild moves the flow onto another taste, as when a member leaves a
+// group: the answers given so far are applied again, in order, and the
+// screen to show next is returned, replacing the one shown before, whose
+// buttons go stale. When the flow has just finished, its results are
+// ranked again over the new taste.
+func (s *Session) Rebuild(taste score.Taste) (Screen, error) {
+	p := pick.New(taste)
+	var last pick.Outcome
+	stopped := false
+	for _, st := range s.log {
+		switch {
+		case st.stop:
+			stopped = true
+			continue
+		case st.undo:
+			p.Undo()
+			last = pick.Outcome{}
+			continue
+		}
+		out, err := p.Apply(st.answer)
+		if err != nil {
+			return Screen{}, err
+		}
+		last = out
+	}
+	s.taste, s.pick, s.done = taste, p, false
+	switch {
+	case stopped:
+		return s.finish(""), nil
+	case last.Empty != nil:
+		return s.emptyScreen(*last.Empty), nil
+	}
+	return s.next(""), nil
 }
 
 // why returns a result's full explanation as a new screen.

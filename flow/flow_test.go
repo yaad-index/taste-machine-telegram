@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/yaad-index/taste-machine/dataset"
 	"github.com/yaad-index/taste-machine/fileformat"
+	"github.com/yaad-index/taste-machine/group"
 	"github.com/yaad-index/taste-machine/pick"
 	"github.com/yaad-index/taste-machine/schema"
 	"github.com/yaad-index/taste-machine/score"
@@ -16,33 +17,54 @@ import (
 	"github.com/yaad-index/taste-machine-telegram/flow"
 )
 
-// taste is a shelf of nine items over two askable fields, theme (a
-// preference) and solo (a filter), with names; the member rated b highly.
-func taste(t *testing.T, meta *fileformat.TasteMeta) score.Taste {
-	t.Helper()
+// shelf is nine items over two askable fields, theme (a preference) and
+// solo (a filter), with names.
+func shelf() *fileformat.Catalogue {
 	sch := schema.Schema{Fields: []schema.Field{
 		{Name: "theme", Type: schema.Category, Role: schema.Preference, Askable: true},
 		{Name: "solo", Type: schema.Bool, Role: schema.Filter, Askable: true},
 		{Name: "name", Type: schema.Category, Role: schema.Info, Display: true},
 	}}
-	shelf := &fileformat.Catalogue{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: "s", Kind: fileformat.KindCatalogue, Schema: sch}}
+	c := &fileformat.Catalogue{Meta: fileformat.Metadata{FormatVersion: 1, SchemaID: "s", Kind: fileformat.KindCatalogue, Schema: sch}}
 	for i, theme := range []string{"sea", "sea", "sea", "sea", "space", "space", "space", "space", "forest"} {
 		id := string(rune('a' + i))
-		shelf.Items = append(shelf.Items, fileformat.Item{ID: id, Facts: map[string]schema.Value{
+		c.Items = append(c.Items, fileformat.Item{ID: id, Facts: map[string]schema.Value{
 			"theme": {Type: schema.Category, Category: theme},
 			"solo":  {Type: schema.Bool, Bool: i == 0},
 			"name":  {Type: schema.Category, Category: "Item " + strings.ToUpper(id)},
 		}})
 	}
-	rating := 9.0
-	low := 2.0
-	tf := &fileformat.Taste{
+	return c
+}
+
+// tasteFile rates high highly and low poorly.
+func tasteFile(meta *fileformat.TasteMeta, high, low string) *fileformat.Taste {
+	h, l := 9.0, 2.0
+	return &fileformat.Taste{
 		Meta:  fileformat.Metadata{FormatVersion: 1, SchemaID: "s", Kind: fileformat.KindTaste, Taste: meta},
-		Items: []fileformat.TasteItem{{ID: "b", Rating: &rating}, {ID: "f", Rating: &low}},
+		Items: []fileformat.TasteItem{{ID: high, Rating: &h}, {ID: low, Rating: &l}},
 	}
-	d, err := dataset.Load(shelf, []dataset.Input{{Taste: tf, Name: "me"}}, nil)
+}
+
+// taste is one member who rated b highly and f poorly.
+func taste(t *testing.T, meta *fileformat.TasteMeta) score.Taste {
+	t.Helper()
+	d, err := dataset.Load(shelf(), []dataset.Input{{Taste: tasteFile(meta, "b", "f"), Name: "me"}}, nil)
 	require.NoError(t, err)
 	return score.Learn(d, d.Members[0])
+}
+
+// pair is a group: ann as taste's member, and bob, who rated f highly.
+func pair(t *testing.T) score.Taste {
+	t.Helper()
+	d, err := dataset.Load(shelf(), []dataset.Input{
+		{Taste: tasteFile(nil, "b", "f"), Name: "ann"},
+		{Taste: tasteFile(nil, "f", "b"), Name: "bob"},
+	}, nil)
+	require.NoError(t, err)
+	g, err := group.New(d, 0, score.DefaultAnswerWeight)
+	require.NoError(t, err)
+	return g
 }
 
 // tap finds the button whose text starts with label on screen and taps it.
@@ -196,4 +218,64 @@ func TestStartReportsDeclaredFilters(t *testing.T) {
 	assert.True(t, s.Done())
 	assert.Equal(t, "Nothing on your shelf passes your filters:\n  9 removed: on the blocked list", screen.Text)
 	assert.Empty(t, screen.Buttons)
+}
+
+func TestGroupResultsShowEachMember(t *testing.T) {
+	s := flow.New("abcd1234", pair(t))
+	r := tap(t, s, s.Start(), "show results now")
+	assert.Regexp(t, `\n    ann -?\d\.\d{3}, bob -?\d\.\d{3}`, r.Send[0].Text, "each member's score, by label")
+}
+
+// A group that loses a member continues over the one left, and ends where
+// a fresh single-member run with the same answers ends.
+func TestRebuildMatchesAFreshRun(t *testing.T) {
+	group := flow.New("abcd1234", pair(t))
+	screen := group.Start()
+	r := tap(t, group, screen, "sea")
+	rebuilt, err := group.Rebuild(taste(t, nil))
+	require.NoError(t, err)
+	_, err = group.Tap(r.Send[0].Buttons[0][0].Data)
+	require.ErrorIs(t, err, flow.ErrStale, "the screen shown before the rebuild is stale")
+
+	fresh := flow.New("ffff0000", taste(t, nil))
+	freshScreen := tap(t, fresh, fresh.Start(), "sea").Send[0]
+	assert.Equal(t, freshScreen.Text, rebuilt.Text, "the same next question")
+
+	got := tap(t, group, rebuilt, "show results now").Send[0].Text
+	want := tap(t, fresh, freshScreen, "show results now").Send[0].Text
+	assert.Equal(t, want, got)
+	assert.NotContains(t, got, "bob", "no member scores in single mode")
+}
+
+func TestRebuildReplaysUndo(t *testing.T) {
+	s := flow.New("abcd1234", pair(t))
+	r := tap(t, s, s.Start(), "no preference")
+	r = tap(t, s, r.Send[0], "other")
+	require.True(t, strings.HasPrefix(r.Send[0].Text, "No items left:"))
+
+	rebuilt, err := s.Rebuild(taste(t, nil))
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(rebuilt.Text, "No items left:"), "an empty report still awaiting Undo is shown again")
+	r = tap(t, s, rebuilt, "Undo")
+	assert.Equal(t, "Undone; solo is skipped.", r.Edit.Text)
+	assert.True(t, strings.HasPrefix(r.Send[0].Text, "Top picks:\n1. b  Item B  "), "the Undo ran on the rebuilt flow: %s", r.Send[0].Text)
+
+	again, err := s.Rebuild(pair(t))
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(again.Text, "Top picks:"), "the Undo is replayed, not the empty report: %s", again.Text)
+}
+
+// Stopping for the results is replayed too: a flow that has just shown
+// its results ranks them again over the new taste.
+func TestRebuildAfterTheResults(t *testing.T) {
+	s := flow.New("abcd1234", pair(t))
+	tap(t, s, s.Start(), "show results now")
+	got, err := s.Rebuild(taste(t, nil))
+	require.NoError(t, err)
+	assert.True(t, s.Done())
+
+	fresh := flow.New("ffff0000", taste(t, nil))
+	want := tap(t, fresh, fresh.Start(), "show results now").Send[0]
+	assert.Equal(t, want.Text, got.Text)
+	assert.Equal(t, flow.Button{Text: "why 1", Data: "abcd1234 w 0"}, got.Buttons[0][0])
 }

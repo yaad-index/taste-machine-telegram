@@ -153,6 +153,7 @@ func convert(u *models.Update) (bot.Update, bool) {
 			Private:    m.Chat.Type == models.ChatTypePrivate,
 			UserID:     cq.From.ID,
 			FirstName:  cq.From.FirstName,
+			Username:   cq.From.Username,
 			CallbackID: cq.ID,
 			Data:       cq.Data,
 			MessageID:  m.ID,
@@ -167,6 +168,7 @@ func convert(u *models.Update) (bot.Update, bool) {
 		Private:   m.Chat.Type == models.ChatTypePrivate,
 		UserID:    m.From.ID,
 		FirstName: m.From.FirstName,
+		Username:  m.From.Username,
 		Text:      m.Text,
 	}, true
 }
