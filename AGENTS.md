@@ -10,7 +10,9 @@ A Go service: a Telegram frontend for the taste-machine engine, which it imports
 
 - `config`: the configuration, read from the environment. Errors name the variable and never print its value.
 - `access`: who may use the bot: admins from the configuration, and users and group chats on an allowlist file with one-time invites.
-- `bot`: command routing and the access rules, on its own `Update` type and a `Sender`, so it is tested without the Telegram client.
+- `userfiles`: each user's shelf and taste files. A compile writes a new version directory and a `current` symlink is swapped to it by rename, so readers never see a mix of two versions.
+- `compile`: runs the engine's `compile` command for a linked account, one compile at a time through a queue. Source-specific settings, such as a source's API key, stay with that command: it inherits this process's environment, less the bot token.
+- `bot`: command routing, the access rules and the link commands, on its own `Update` type and a `Sender`, so it is tested without the Telegram client.
 - `cmd/taste-machine-telegram`: `serve` wires the Telegram client (long polling) to `bot`; `version` prints the version.
 
 ## Before pushing

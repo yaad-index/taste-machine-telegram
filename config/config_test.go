@@ -21,6 +21,11 @@ func TestLoad(t *testing.T) {
 	assert.Equal(t, "secret-token", c.Token)
 	assert.Equal(t, []int64{11, 22}, c.Admins)
 	assert.Equal(t, "/data", c.DataDir)
+	assert.Equal(t, config.DefaultCompile, c.Compile)
+
+	c, err = config.Load(env(map[string]string{config.EnvToken: "t", config.EnvAdmins: "1", config.EnvDataDir: "/d", config.EnvCompile: "/opt/tm"}))
+	require.NoError(t, err)
+	assert.Equal(t, "/opt/tm", c.Compile)
 }
 
 func TestLoadErrors(t *testing.T) {

@@ -8,12 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yaad-index/taste-machine-telegram/access"
+	"github.com/yaad-index/taste-machine-telegram/compile"
+	"github.com/yaad-index/taste-machine-telegram/userfiles"
 )
 
 // Update is one incoming message.
@@ -26,9 +27,11 @@ type Update struct {
 	Text      string
 }
 
-// Sender sends a text message to a chat.
+// Sender sends text messages and edits them.
 type Sender interface {
-	Send(ctx context.Context, chatID int64, text string) error
+	// Send returns the sent message's id.
+	Send(ctx context.Context, chatID int64, text string) (int, error)
+	Edit(ctx context.Context, chatID int64, messageID int, text string) error
 }
 
 // Replies the bot sends.
@@ -45,27 +48,36 @@ const (
 	MsgChatDisallowed  = "This chat is no longer allowed."
 	MsgRevokeUsage     = "Usage: /revoke <user id>"
 	MsgSomethingFailed = "Something went wrong; try again later."
+	MsgLinkUsage       = "Usage: /link <source> <user name>"
+	MsgNotLinked       = "Link an account first: /link <source> <user name>"
+	MsgCompiling       = "Compiling… this can take a minute."
+	MsgAlreadyBusy     = "A compile of yours is already running; wait for it to finish."
+	MsgNothingToUnlink = "You have no linked account."
+	MsgUnlinked        = "Your account is unlinked and your files are deleted."
 )
 
+// CompileEvery is the shortest time between two compiles of one user.
+const CompileEvery = time.Hour
+
+// Deps are what a Bot works with.
+type Deps struct {
+	Access *access.Store
+	Files  *userfiles.Store
+	// Queue runs compiles; its Done should be the bot's CompileDone.
+	Queue *compile.Queue
+	Send  Sender
+	// Name is the bot's username, used in invite links and to recognise
+	// commands addressed to it in group chats.
+	Name string
+	Log  *slog.Logger
+	Now  func() time.Time
+}
+
 // Bot handles updates.
-type Bot struct {
-	access  *access.Store
-	send    Sender
-	name    string
-	dataDir string
-	log     *slog.Logger
-}
+type Bot struct{ Deps }
 
-// New returns a bot. name is the bot's username, used in invite links and
-// to recognise commands addressed to it in group chats.
-func New(store *access.Store, send Sender, name, dataDir string, log *slog.Logger) *Bot {
-	return &Bot{access: store, send: send, name: name, dataDir: dataDir, log: log}
-}
-
-// UserDir is where a user's files live.
-func UserDir(dataDir string, user int64) string {
-	return filepath.Join(dataDir, "users", strconv.FormatInt(user, 10))
-}
+// New returns a bot.
+func New(d Deps) *Bot { return &Bot{d} }
 
 // Handle answers one update. Nothing about a user who is not allowed is
 // logged or stored.
@@ -79,12 +91,12 @@ func (b *Bot) Handle(ctx context.Context, u Update) {
 }
 
 func (b *Bot) private(ctx context.Context, u Update, cmd, arg string, isCmd bool) {
-	if !b.access.UserAllowed(u.UserID) {
+	if !b.Access.UserAllowed(u.UserID) {
 		if cmd == "start" && arg != "" {
 			b.redeem(ctx, u, arg)
 			return
 		}
-		_ = b.send.Send(ctx, u.ChatID, MsgRefused)
+		_, _ = b.Send.Send(ctx, u.ChatID, MsgRefused)
 		return
 	}
 	if !isCmd {
@@ -98,6 +110,12 @@ func (b *Bot) private(ctx context.Context, u Update, cmd, arg string, isCmd bool
 		b.invite(ctx, u)
 	case "revoke":
 		b.revoke(ctx, u, arg)
+	case "link":
+		b.link(ctx, u, arg)
+	case "refresh":
+		b.refresh(ctx, u)
+	case "unlink":
+		b.unlink(ctx, u)
 	case "allow", "disallow":
 		b.reply(ctx, u, MsgInGroupOnly)
 	default:
@@ -106,8 +124,8 @@ func (b *Bot) private(ctx context.Context, u Update, cmd, arg string, isCmd bool
 }
 
 func (b *Bot) group(ctx context.Context, u Update, cmd, arg string) {
-	if !b.access.UserAllowed(u.UserID) {
-		_ = b.send.Send(ctx, u.ChatID, MsgRefused)
+	if !b.Access.UserAllowed(u.UserID) {
+		_, _ = b.Send.Send(ctx, u.ChatID, MsgRefused)
 		return
 	}
 	switch cmd {
@@ -115,14 +133,14 @@ func (b *Bot) group(ctx context.Context, u Update, cmd, arg string) {
 		b.allow(ctx, u, cmd == "allow")
 		return
 	}
-	if !b.access.ChatAllowed(u.ChatID) {
+	if !b.Access.ChatAllowed(u.ChatID) {
 		b.reply(ctx, u, MsgChatNotAllowed)
 		return
 	}
 	switch cmd {
 	case "start", "help":
 		b.reply(ctx, u, b.help(u.UserID))
-	case "invite", "revoke":
+	case "invite", "revoke", "link", "refresh", "unlink":
 		b.reply(ctx, u, MsgInPrivateOnly)
 	default:
 		b.reply(ctx, u, MsgUnknown)
@@ -130,39 +148,39 @@ func (b *Bot) group(ctx context.Context, u Update, cmd, arg string) {
 }
 
 func (b *Bot) redeem(ctx context.Context, u Update, token string) {
-	if err := b.access.Redeem(token, u.UserID); err != nil {
+	if err := b.Access.Redeem(token, u.UserID); err != nil {
 		if !errors.Is(err, access.ErrInvalidInvite) {
-			b.log.Error("redeeming an invite", "err", err)
+			b.Log.Error("redeeming an invite", "err", err)
 		}
-		_ = b.send.Send(ctx, u.ChatID, MsgInviteInvalid)
+		_, _ = b.Send.Send(ctx, u.ChatID, MsgInviteInvalid)
 		return
 	}
 	b.reply(ctx, u, MsgWelcome)
 	note := fmt.Sprintf("%s joined through an invite (user id %d). /revoke %d removes them.", u.FirstName, u.UserID, u.UserID)
-	for _, admin := range b.access.Admins() {
-		if err := b.send.Send(ctx, admin, note); err != nil {
-			b.log.Error("telling an admin about a new user", "err", err)
+	for _, admin := range b.Access.Admins() {
+		if _, err := b.Send.Send(ctx, admin, note); err != nil {
+			b.Log.Error("telling an admin about a new user", "err", err)
 		}
 	}
 }
 
 func (b *Bot) invite(ctx context.Context, u Update) {
-	if !b.access.IsAdmin(u.UserID) {
+	if !b.Access.IsAdmin(u.UserID) {
 		b.reply(ctx, u, MsgAdminOnly)
 		return
 	}
-	token, expires, err := b.access.Invite()
+	token, expires, err := b.Access.Invite()
 	if err != nil {
-		b.log.Error("creating an invite", "err", err)
+		b.Log.Error("creating an invite", "err", err)
 		b.reply(ctx, u, MsgSomethingFailed)
 		return
 	}
 	b.reply(ctx, u, fmt.Sprintf("One-time invite, valid until %s:\nhttps://t.me/%s?start=%s",
-		expires.UTC().Format("2006-01-02 15:04 UTC"), b.name, token))
+		expires.UTC().Format("2006-01-02 15:04 UTC"), b.Name, token))
 }
 
 func (b *Bot) revoke(ctx context.Context, u Update, arg string) {
-	if !b.access.IsAdmin(u.UserID) {
+	if !b.Access.IsAdmin(u.UserID) {
 		b.reply(ctx, u, MsgAdminOnly)
 		return
 	}
@@ -171,18 +189,18 @@ func (b *Bot) revoke(ctx context.Context, u Update, arg string) {
 		b.reply(ctx, u, MsgRevokeUsage)
 		return
 	}
-	found, err := b.access.Revoke(id)
+	found, err := b.Access.Revoke(id)
 	switch {
 	case errors.Is(err, access.ErrAdmin):
 		b.reply(ctx, u, "Admins come from the configuration and cannot be revoked.")
 		return
 	case err != nil:
-		b.log.Error("revoking a user", "err", err)
+		b.Log.Error("revoking a user", "err", err)
 		b.reply(ctx, u, MsgSomethingFailed)
 		return
 	}
-	if err := os.RemoveAll(UserDir(b.dataDir, id)); err != nil {
-		b.log.Error("deleting a revoked user's files", "err", err)
+	if err := b.Files.Remove(id); err != nil {
+		b.Log.Error("deleting a revoked user's files", "err", err)
 		b.reply(ctx, u, fmt.Sprintf("User %d is revoked, but deleting their files failed.", id))
 		return
 	}
@@ -194,16 +212,16 @@ func (b *Bot) revoke(ctx context.Context, u Update, arg string) {
 }
 
 func (b *Bot) allow(ctx context.Context, u Update, allow bool) {
-	if !b.access.IsAdmin(u.UserID) {
+	if !b.Access.IsAdmin(u.UserID) {
 		b.reply(ctx, u, MsgAdminOnly)
 		return
 	}
-	change, msg := b.access.Disallow, MsgChatDisallowed
+	change, msg := b.Access.Disallow, MsgChatDisallowed
 	if allow {
-		change, msg = b.access.Allow, MsgChatAllowed
+		change, msg = b.Access.Allow, MsgChatAllowed
 	}
 	if err := change(u.ChatID); err != nil {
-		b.log.Error("changing the chat allowlist", "err", err)
+		b.Log.Error("changing the chat allowlist", "err", err)
 		b.reply(ctx, u, MsgSomethingFailed)
 		return
 	}
@@ -211,8 +229,14 @@ func (b *Bot) allow(ctx context.Context, u Update, allow bool) {
 }
 
 func (b *Bot) help(user int64) string {
-	lines := []string{"Commands:", "/help shows this list."}
-	if b.access.IsAdmin(user) {
+	lines := []string{
+		"Commands:",
+		"/help shows this list.",
+		"/link <source> <user name> compiles your shelf and taste from a source account (private chat).",
+		"/refresh compiles them again; at most once an hour (private chat).",
+		"/unlink deletes your files (private chat).",
+	}
+	if b.Access.IsAdmin(user) {
 		lines = append(lines,
 			"/invite creates a one-time invite link (private chat).",
 			"/revoke <user id> removes a user and deletes their files (private chat).",
@@ -221,10 +245,89 @@ func (b *Bot) help(user int64) string {
 	return strings.Join(lines, "\n")
 }
 
+func (b *Bot) link(ctx context.Context, u Update, arg string) {
+	source, name, _ := strings.Cut(arg, " ")
+	l := userfiles.Link{Source: strings.ToLower(source), User: strings.TrimSpace(name)}
+	if err := compile.ValidateLink(l); err != nil {
+		b.reply(ctx, u, MsgLinkUsage+"\n"+err.Error())
+		return
+	}
+	b.startCompile(ctx, u, l)
+}
+
+func (b *Bot) refresh(ctx context.Context, u Update) {
+	l, err := b.Files.Link(u.UserID)
+	switch {
+	case errors.Is(err, userfiles.ErrNotLinked):
+		b.reply(ctx, u, MsgNotLinked)
+		return
+	case err != nil:
+		b.Log.Error("reading a link", "err", err)
+		b.reply(ctx, u, MsgSomethingFailed)
+		return
+	}
+	b.startCompile(ctx, u, l)
+}
+
+// startCompile applies the busy check and the hourly limit, replies
+// "compiling…" and queues the compile; CompileDone edits that reply.
+func (b *Bot) startCompile(ctx context.Context, u Update, l userfiles.Link) {
+	if b.Queue.Busy(u.UserID) {
+		b.reply(ctx, u, MsgAlreadyBusy)
+		return
+	}
+	if last, ok := b.Files.LastCompile(u.UserID); ok {
+		if next := last.Add(CompileEvery); b.Now().Before(next) {
+			b.reply(ctx, u, fmt.Sprintf("You can compile again after %s.", next.UTC().Format("15:04 UTC")))
+			return
+		}
+	}
+	msg, err := b.Send.Send(ctx, u.ChatID, MsgCompiling)
+	if err != nil {
+		b.Log.Error("sending a reply", "err", err)
+		return
+	}
+	if !b.Queue.Add(compile.Job{User: u.UserID, Link: l, Chat: u.ChatID, Message: msg}) {
+		b.edit(ctx, u.ChatID, msg, MsgAlreadyBusy)
+	}
+}
+
+// CompileDone reports a finished compile by editing its "compiling…" reply.
+func (b *Bot) CompileDone(ctx context.Context, j compile.Job, sum userfiles.Summary, err error) {
+	text := fmt.Sprintf("Done: %d items on your shelf, %d of your items rated.", sum.Shelf, sum.Rated)
+	if err != nil {
+		text = "The compile failed: " + err.Error()
+	}
+	b.edit(ctx, j.Chat, j.Message, text)
+}
+
+func (b *Bot) unlink(ctx context.Context, u Update) {
+	if b.Queue.Busy(u.UserID) {
+		b.reply(ctx, u, MsgAlreadyBusy)
+		return
+	}
+	if _, err := b.Files.Link(u.UserID); errors.Is(err, userfiles.ErrNotLinked) {
+		b.reply(ctx, u, MsgNothingToUnlink)
+		return
+	}
+	if err := b.Files.Remove(u.UserID); err != nil {
+		b.Log.Error("deleting a user's files", "err", err)
+		b.reply(ctx, u, MsgSomethingFailed)
+		return
+	}
+	b.reply(ctx, u, MsgUnlinked)
+}
+
+func (b *Bot) edit(ctx context.Context, chat int64, msg int, text string) {
+	if err := b.Send.Edit(ctx, chat, msg, text); err != nil {
+		b.Log.Error("editing a reply", "err", err)
+	}
+}
+
 // reply answers an allowed user; a failed send is logged without content.
 func (b *Bot) reply(ctx context.Context, u Update, text string) {
-	if err := b.send.Send(ctx, u.ChatID, text); err != nil {
-		b.log.Error("sending a reply", "err", err)
+	if _, err := b.Send.Send(ctx, u.ChatID, text); err != nil {
+		b.Log.Error("sending a reply", "err", err)
 	}
 }
 
@@ -236,7 +339,7 @@ func (b *Bot) command(text string) (cmd, arg string, ok bool) {
 	}
 	head, arg, _ := strings.Cut(strings.TrimSpace(text[1:]), " ")
 	name, target, addressed := strings.Cut(head, "@")
-	if addressed && !strings.EqualFold(target, b.name) {
+	if addressed && !strings.EqualFold(target, b.Name) {
 		return "", "", false
 	}
 	if name == "" {
