@@ -14,7 +14,12 @@ const (
 	EnvToken   = "TASTE_MACHINE_TELEGRAM_TOKEN"
 	EnvAdmins  = "TASTE_MACHINE_TELEGRAM_ADMINS"
 	EnvDataDir = "TASTE_MACHINE_TELEGRAM_DATA_DIR"
+	EnvCompile = "TASTE_MACHINE_TELEGRAM_COMPILE"
 )
+
+// DefaultCompile is the engine's command, found on PATH unless EnvCompile
+// names another.
+const DefaultCompile = "taste-machine"
 
 // Config is the service's configuration.
 type Config struct {
@@ -25,6 +30,8 @@ type Config struct {
 	Admins []int64
 	// DataDir holds the allowlist file and every user's files.
 	DataDir string
+	// Compile is the engine's command, run as `<Compile> compile ...`.
+	Compile string
 }
 
 // Load reads the configuration through getenv.
@@ -33,6 +40,10 @@ func Load(getenv func(string) string) (Config, error) {
 	c := Config{
 		Token:   strings.TrimSpace(getenv(EnvToken)),
 		DataDir: strings.TrimSpace(getenv(EnvDataDir)),
+		Compile: strings.TrimSpace(getenv(EnvCompile)),
+	}
+	if c.Compile == "" {
+		c.Compile = DefaultCompile
 	}
 	if c.Token == "" {
 		errs = append(errs, fmt.Errorf("%s is not set", EnvToken))

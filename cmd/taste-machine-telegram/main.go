@@ -20,7 +20,9 @@ import (
 
 	"github.com/yaad-index/taste-machine-telegram/access"
 	"github.com/yaad-index/taste-machine-telegram/bot"
+	"github.com/yaad-index/taste-machine-telegram/compile"
 	"github.com/yaad-index/taste-machine-telegram/config"
+	"github.com/yaad-index/taste-machine-telegram/userfiles"
 )
 
 // version is set at release build time with -ldflags "-X main.version=...".
@@ -30,6 +32,7 @@ var version = "dev"
 type env struct {
 	stdout, stderr io.Writer
 	getenv         func(string) string
+	environ        func() []string
 	// clientOptions are added to the Telegram client's options.
 	clientOptions []tgbot.Option
 }
@@ -37,7 +40,7 @@ type env struct {
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	os.Exit(run(ctx, os.Args[1:], env{stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv}))
+	os.Exit(run(ctx, os.Args[1:], env{stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv, environ: os.Environ}))
 }
 
 const usage = "usage: taste-machine-telegram serve | version"
@@ -77,7 +80,13 @@ func serve(ctx context.Context, e env) error {
 	if err != nil {
 		return err
 	}
+	files := userfiles.New(cfg.DataDir)
 	var b *bot.Bot
+	childEnv, secrets := compileEnv(e.environ(), cfg.Token)
+	queue := compile.NewQueue(compile.CLI{Path: cfg.Compile, Env: childEnv, Secrets: secrets}, files, store.UserAllowed,
+		func(ctx context.Context, j compile.Job, sum userfiles.Summary, err error) {
+			b.CompileDone(ctx, j, sum, err)
+		})
 	opts := append([]tgbot.Option{
 		// Handlers run on the client's workers, which Start waits for, so
 		// serve returns only after every reply in flight is done.
@@ -99,10 +108,35 @@ func serve(ctx context.Context, e env) error {
 	if err != nil {
 		return errors.New(redact(err, cfg.Token))
 	}
-	b = bot.New(store, sender{client}, me.Username, cfg.DataDir, log)
+	b = bot.New(bot.Deps{Access: store, Files: files, Queue: queue, Send: sender{client}, Name: me.Username, Log: log, Now: time.Now})
 	log.Info("started", "version", version, "bot", me.Username)
+	queueDone := make(chan struct{})
+	go func() { queue.Run(ctx); close(queueDone) }()
 	client.Start(ctx)
+	<-queueDone
 	return nil
+}
+
+// compileEnv is the compile command's environment: this process's, less
+// the bot token. secrets are the values masked in compile errors: the
+// token, and any variable whose name ends in _KEY, _TOKEN, _SECRET or
+// _PASSWORD, which is where a source's API key lives.
+func compileEnv(environ []string, token string) (env, secrets []string) {
+	secrets = []string{token}
+	for _, kv := range environ {
+		name, value, _ := strings.Cut(kv, "=")
+		if name == config.EnvToken {
+			continue
+		}
+		env = append(env, kv)
+		for _, suffix := range []string{"_KEY", "_TOKEN", "_SECRET", "_PASSWORD"} {
+			if strings.HasSuffix(name, suffix) && value != "" {
+				secrets = append(secrets, value)
+				break
+			}
+		}
+	}
+	return env, secrets
 }
 
 // convert keeps the messages the bot answers: text from a person.
@@ -122,8 +156,16 @@ func convert(u *models.Update) (bot.Update, bool) {
 
 type sender struct{ c *tgbot.Bot }
 
-func (s sender) Send(ctx context.Context, chatID int64, text string) error {
-	_, err := s.c.SendMessage(ctx, &tgbot.SendMessageParams{ChatID: chatID, Text: text})
+func (s sender) Send(ctx context.Context, chatID int64, text string) (int, error) {
+	m, err := s.c.SendMessage(ctx, &tgbot.SendMessageParams{ChatID: chatID, Text: text})
+	if err != nil {
+		return 0, err
+	}
+	return m.ID, nil
+}
+
+func (s sender) Edit(ctx context.Context, chatID int64, messageID int, text string) error {
+	_, err := s.c.EditMessageText(ctx, &tgbot.EditMessageTextParams{ChatID: chatID, MessageID: messageID, Text: text})
 	return err
 }
 
