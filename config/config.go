@@ -15,7 +15,12 @@ const (
 	EnvAdmins  = "TASTE_MACHINE_TELEGRAM_ADMINS"
 	EnvDataDir = "TASTE_MACHINE_TELEGRAM_DATA_DIR"
 	EnvCompile = "TASTE_MACHINE_TELEGRAM_COMPILE"
+	EnvHealth  = "TASTE_MACHINE_TELEGRAM_HEALTH_ADDR"
+	EnvAPIURL  = "TASTE_MACHINE_TELEGRAM_API_URL"
 )
+
+// DefaultHealth is where the health endpoint listens by default.
+const DefaultHealth = ":8080"
 
 // DefaultCompile is the engine's command, found on PATH unless EnvCompile
 // names another.
@@ -32,6 +37,10 @@ type Config struct {
 	DataDir string
 	// Compile is the engine's command, run as `<Compile> compile ...`.
 	Compile string
+	// Health is the health endpoint's listen address.
+	Health string
+	// APIURL is the Bot API server; empty means Telegram's own.
+	APIURL string
 }
 
 // Load reads the configuration through getenv.
@@ -45,6 +54,8 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.Compile == "" {
 		c.Compile = DefaultCompile
 	}
+	c.Health = HealthAddr(getenv)
+	c.APIURL = strings.TrimSpace(getenv(EnvAPIURL))
 	if c.Token == "" {
 		errs = append(errs, fmt.Errorf("%s is not set", EnvToken))
 	}
@@ -57,6 +68,15 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	c.Admins = admins
 	return c, errors.Join(errs...)
+}
+
+// HealthAddr is the health endpoint's address, read on its own so the
+// container's health check needs no other setting.
+func HealthAddr(getenv func(string) string) string {
+	if a := strings.TrimSpace(getenv(EnvHealth)); a != "" {
+		return a
+	}
+	return DefaultHealth
 }
 
 // parseIDs reads a comma-separated list of at least one user id.
