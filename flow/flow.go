@@ -98,10 +98,37 @@ func (s *Session) next(prefix string) Screen {
 	for i, o := range q.Options {
 		rows = append(rows, []Button{{Text: fmt.Sprintf("%s (%d)", o.Label, o.Count), Data: s.data("o" + strconv.Itoa(i))}})
 	}
-	rows = append(rows,
-		[]Button{{Text: "other", Data: s.data("x")}, {Text: "no preference", Data: s.data("n")}},
-		[]Button{{Text: "show results now", Data: s.data("s")}})
-	return Screen{Text: prefix + fmt.Sprintf("%s? (%d left)", q.Field.Name, s.pick.Remaining()), Buttons: rows}
+	rows = append(rows, []Button{{Text: "none of these", Data: s.data("x")}, {Text: "skip", Data: s.data("n")}})
+	last := []Button{{Text: "show results now", Data: s.data("s")}}
+	if s.lastAnswer() >= 0 {
+		last = append([]Button{{Text: "back", Data: s.data("b")}}, last...)
+	}
+	rows = append(rows, last)
+	text := fmt.Sprintf("Step %d · %d items left\n%s?", s.answers()+1, s.pick.Remaining(), q.Field.Name)
+	return Screen{Text: prefix + text, Buttons: rows}
+}
+
+// answers counts the answers given so far, including one later undone:
+// its question was still asked.
+func (s *Session) answers() int {
+	n := 0
+	for _, st := range s.log {
+		if !st.undo && !st.stop {
+			n++
+		}
+	}
+	return n
+}
+
+// lastAnswer returns the log index of the last answer, or -1 when none
+// was given.
+func (s *Session) lastAnswer() int {
+	for i := len(s.log) - 1; i >= 0; i-- {
+		if !s.log[i].undo && !s.log[i].stop {
+			return i
+		}
+	}
+	return -1
 }
 
 // finish ranks what remains and returns the results screen.
@@ -156,14 +183,16 @@ func (s *Session) Tap(data string) (Reply, error) {
 		s.pick.Undo()
 		s.log = append(s.log, step{undo: true})
 		return Reply{Edit: &Screen{Text: "Undone; " + f.Name + " is skipped."}, Send: []Screen{s.next("")}}, nil
+	case act == "b":
+		return s.back(f.Name)
 	case act == "n":
-		return s.apply(pick.Answer{Field: f.Name, Kind: pick.NoPreference}, "no preference")
+		return s.apply(pick.Answer{Field: f.Name, Kind: pick.NoPreference}, "skipped")
 	case act == "x":
 		shown := make([]string, 0, len(s.question.Options))
 		for _, o := range s.question.Options {
 			shown = append(shown, o.Key)
 		}
-		return s.apply(pick.Answer{Field: f.Name, Kind: pick.Other, Shown: shown}, "other")
+		return s.apply(pick.Answer{Field: f.Name, Kind: pick.Other, Shown: shown}, "none of these")
 	case strings.HasPrefix(act, "o"):
 		i, err := strconv.Atoi(act[1:])
 		if err != nil || i < 0 || i >= len(s.question.Options) {
@@ -191,6 +220,23 @@ func (s *Session) apply(a pick.Answer, label string) (Reply, error) {
 	// Options come from the items that remain, each with at least one
 	// match, so an answer from a button is never unmet.
 	return Reply{Edit: edit, Send: []Screen{s.next("")}}, nil
+}
+
+// back takes back the last answer, with the Undo that followed it if any,
+// and asks its question again. The engine's Undo would skip the field
+// instead, so the answers before it are replayed over a new engine
+// session, as Rebuild does.
+func (s *Session) back(field string) (Reply, error) {
+	i := s.lastAnswer()
+	if i < 0 {
+		return Reply{}, errors.New("there is no answer to take back")
+	}
+	s.log = s.log[:i]
+	screen, err := s.Rebuild(s.taste)
+	if err != nil {
+		return Reply{}, err
+	}
+	return Reply{Edit: &Screen{Text: field + ": (back)"}, Send: []Screen{screen}}, nil
 }
 
 func (s *Session) emptyScreen(r score.EmptyReport) Screen {
