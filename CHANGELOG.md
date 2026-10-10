@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/yaad-index/taste-machine-telegram/compare/v0.1.0...v0.2.0) (2026-10-10)
+
+
+### Features
+
+* easier question navigation in /pick and /night ([#20](https://github.com/yaad-index/taste-machine-telegram/issues/20)) ([b8927c3](https://github.com/yaad-index/taste-machine-telegram/commit/b8927c3ad3967ef76b68679bbe0d36d6739f9a92)), closes [#19](https://github.com/yaad-index/taste-machine-telegram/issues/19)
+
 ## 0.1.0 (2026-10-08)
 
 
