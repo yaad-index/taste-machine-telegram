@@ -521,12 +521,12 @@ func TestPickNeedsALink(t *testing.T) {
 func TestPickFlow(t *testing.T) {
 	f := newFixture(t)
 	f.linked(t)
-	assert.Equal(t, "theme? (6 left)", f.say(member, "/pick"))
+	assert.Equal(t, "Step 1 · 6 items left\ntheme?", f.say(member, "/pick"))
 	q := f.send.count()
-	assert.Len(t, f.send.message(q).buttons, 5, "three options, other and no preference, show results now")
+	assert.Len(t, f.send.message(q).buttons, 5, "three options, none of these and skip, show results now")
 
 	assert.Empty(t, f.press(t, member, q, "space"), "a tap is acknowledged without a notice")
-	assert.Equal(t, sent{chat: member, text: "theme: space", first: "theme? (6 left)"}, f.send.message(q), "the question is edited in place to show the answer, without buttons")
+	assert.Equal(t, sent{chat: member, text: "theme: space", first: "Step 1 · 6 items left\ntheme?"}, f.send.message(q), "the question is edited in place to show the answer, without buttons")
 	results := f.send.count()
 	require.Equal(t, results, q+1)
 	got := f.send.message(results)
@@ -544,7 +544,7 @@ func TestPickTapRules(t *testing.T) {
 	f.say(member, "/pick")
 	first := f.send.count()
 	oldData := f.send.message(first).buttons[0][0].Data
-	f.press(t, member, first, "no preference")
+	f.press(t, member, first, "skip")
 	assert.Equal(t, bot.MsgStaleTap, f.pressData(member, first, oldData))
 
 	f.say(member, "/pick")
@@ -662,7 +662,7 @@ func TestNightPick(t *testing.T) {
 	f.tapIn(t, member, "Ann", lobby, "I'm in")
 	f.tapIn(t, other, "Bob", lobby, "I'm in")
 
-	assert.Equal(t, "theme? (6 left)", f.in(member, "Ann", "", "/pick"))
+	assert.Equal(t, "Step 1 · 6 items left\ntheme?", f.in(member, "Ann", "", "/pick"))
 	q := f.send.count()
 	assert.Equal(t, bot.MsgPickRunning, f.in(other, "Bob", "", "/pick"))
 	f.admit(t, 9)
@@ -670,7 +670,7 @@ func TestNightPick(t *testing.T) {
 	assert.Equal(t, bot.MsgMembersOnly, f.tapIn(t, 9, "Cat", q, "sea"), "only members answer")
 	old := f.send.message(q).buttons[0][0].Data
 	assert.Empty(t, f.tapIn(t, other, "Bob", q, "space"))
-	assert.Equal(t, sent{chat: group, text: "theme: space (Bob)", first: "theme? (6 left)"}, f.send.message(q), "the question shows the answer and who gave it")
+	assert.Equal(t, sent{chat: group, text: "theme: space (Bob)", first: "Step 1 · 6 items left\ntheme?"}, f.send.message(q), "the question shows the answer and who gave it")
 	assert.Equal(t, bot.MsgStaleTap, f.tapData(member, "Ann", q, old), "the first tap counts")
 
 	results := f.send.message(f.send.count()).text
@@ -734,7 +734,7 @@ func TestRevokeDuringANight(t *testing.T) {
 	f.in(member, "Ann", "", "/pick")
 	q := f.send.count()
 	f.say(admin, "/revoke 8")
-	assert.Equal(t, sent{chat: group, text: "theme? (6 left)", buttons: f.send.message(q).buttons, first: "theme? (6 left)"}, f.send.message(q), "nothing changes until the next answer")
+	assert.Equal(t, sent{chat: group, text: "Step 1 · 6 items left\ntheme?", buttons: f.send.message(q).buttons, first: "Step 1 · 6 items left\ntheme?"}, f.send.message(q), "nothing changes until the next answer")
 	f.tapIn(t, member, "Ann", q, "space")
 	next := f.send.message(f.send.count()).text
 	assert.NotContains(t, next, "Bob", "the flow moved onto the member left")
@@ -759,7 +759,7 @@ func TestNightLeavesOutMembersWithoutFiles(t *testing.T) {
 	f.tapIn(t, other, "Bob", lobby, "I'm in")
 	require.Equal(t, bot.MsgUnlinked, f.say(other, "/unlink"))
 	text := f.in(member, "Ann", "", "/pick")
-	assert.True(t, strings.HasPrefix(text, "Left out, their files are gone: Bob.\n\ntheme? (6 left)"), text)
+	assert.True(t, strings.HasPrefix(text, "Left out, their files are gone: Bob.\n\nStep 1 · 6 items left\ntheme?"), text)
 }
 
 func TestNightInADisallowedChat(t *testing.T) {

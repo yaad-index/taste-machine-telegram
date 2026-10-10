@@ -27,7 +27,9 @@ taste-machine (the engine) works on files from a command line. To be used at a t
 
 ### 4. Picking alone (private chat)
 - `/pick` starts a question flow on the caller's own shelf, as in engine ADR 0002.
-- Each question is one message with an inline button per option, plus "other" and "no preference". Tapping edits the message to show the answer, then the next question follows.
+- Each question is one message, headed "Step N · K items left", with an inline button per option, plus "none of these" and "skip" (the engine's "other" and "no preference"). Tapping edits the message to show the answer, then the next question follows.
+  - N is the number of answers given so far, plus one. The engine picks each question as it goes, so how many are left is not known in advance and is not shown.
+- From the second question on, a "back" button takes back the last answer and asks that question again. The engine's Undo would skip the field instead, so the bot replays the answers before it over a new engine session.
 - A "show results now" button stops the questions early.
 - An answer that leaves nothing gets the engine's empty-result report, with an Undo button.
 - At the end the bot shows the top 5 results with names; the one-line reason is each result's top positive contribution. A button shows the full explanation.
@@ -35,7 +37,7 @@ taste-machine (the engine) works on files from a command line. To be used at a t
 ### 5. Picking as a group (group chat)
 - `/night` opens a session in the chat: members tap "I'm in" to join. A member with no linked files is refused with "use /link in a private chat first"; a member whose files use a different schema from the shelf is refused too.
 - `/pick` runs group mode (engine ADR 0003) with the joined members' tastes, on the shelf of the member who ran `/pick`. With one joined member it runs single mode.
-- Any joined member can answer a question; the first tap counts and the message shows who answered. One answer per question, as the ADR says.
+- Questions have the same buttons as in section 4, back included. Any joined member can answer a question; the first tap counts and the message shows who answered. One answer per question, as the ADR says.
 - Results show the group score and each member's score by their Telegram first name. A duplicate first name gets the member's username added, so labels stay unique.
 - A chat runs one session at a time. Sessions live in memory and a restart ends them, accepted for v1; a tap on a button from an ended session gets "this session has ended (the bot restarted or it timed out); start again with /pick, or /night in a group". A session ends with `/done` or after 6 hours.
 

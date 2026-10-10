@@ -86,11 +86,11 @@ func tap(t *testing.T, s *flow.Session, screen flow.Screen, label string) flow.R
 func TestQuestionScreen(t *testing.T) {
 	s := flow.New("abcd1234", taste(t, nil))
 	q := s.Start()
-	assert.Equal(t, "theme? (9 left)", q.Text)
+	assert.Equal(t, "Step 1 · 9 items left\ntheme?", q.Text)
 	require.Len(t, q.Buttons, 5)
 	assert.Equal(t, []flow.Button{{Text: "sea (4)", Data: "abcd1234 1 o0"}}, q.Buttons[0])
-	assert.Equal(t, []flow.Button{{Text: "other", Data: "abcd1234 1 x"}, {Text: "no preference", Data: "abcd1234 1 n"}}, q.Buttons[3])
-	assert.Equal(t, []flow.Button{{Text: "show results now", Data: "abcd1234 1 s"}}, q.Buttons[4])
+	assert.Equal(t, []flow.Button{{Text: "none of these", Data: "abcd1234 1 x"}, {Text: "skip", Data: "abcd1234 1 n"}}, q.Buttons[3])
+	assert.Equal(t, []flow.Button{{Text: "show results now", Data: "abcd1234 1 s"}}, q.Buttons[4], "no back on the first question")
 	assert.Equal(t, "abcd1234", s.ID())
 	for _, row := range q.Buttons {
 		for _, b := range row {
@@ -111,7 +111,7 @@ func TestMatchesTheEngine(t *testing.T) {
 	for !s.Done() {
 		q, ok := engine.Next()
 		require.True(t, ok)
-		assert.Equal(t, fmt.Sprintf("%s? (%d left)", q.Field.Name, engine.Remaining()), screen.Text)
+		assert.Equal(t, fmt.Sprintf("Step %d · %d items left\n%s?", len(asked)+1, engine.Remaining(), q.Field.Name), screen.Text)
 		asked = append(asked, q.Field.Name)
 		_, err := engine.Apply(pick.Answer{Field: q.Field.Name, Kind: pick.Value, Key: q.Options[0].Key})
 		require.NoError(t, err)
@@ -162,7 +162,7 @@ func TestResultsShowNamesReasonsAndWhy(t *testing.T) {
 func TestStaleAndMalformedTaps(t *testing.T) {
 	s := flow.New("abcd1234", taste(t, nil))
 	first := s.Start()
-	tap(t, s, first, "no preference")
+	tap(t, s, first, "skip")
 	_, err := s.Tap(first.Buttons[0][0].Data)
 	require.ErrorIs(t, err, flow.ErrStale, "a button of an answered question")
 	for _, data := range []string{"", "abcd1234", "other 2 o0", "abcd1234 2 o9", "abcd1234 2 q", "abcd1234 2 ox", "abcd1234 w 0", "abcd1234 2 o0 extra"} {
@@ -170,13 +170,20 @@ func TestStaleAndMalformedTaps(t *testing.T) {
 		require.Error(t, err, data)
 		assert.NotErrorIs(t, err, flow.ErrStale, data)
 	}
+
+	fresh := flow.New("abcd1234", taste(t, nil))
+	fresh.Start()
+	_, err = fresh.Tap("abcd1234 1 b")
+	require.Error(t, err, "back on the first question, which shows no back button")
+	assert.NotErrorIs(t, err, flow.ErrStale)
 }
 
-func TestNoPreferenceSkipsTheField(t *testing.T) {
+func TestSkipIsNoPreference(t *testing.T) {
 	s := flow.New("abcd1234", taste(t, nil))
-	r := tap(t, s, s.Start(), "no preference")
-	assert.Equal(t, "theme: no preference", r.Edit.Text)
-	assert.Equal(t, "solo? (9 left)", r.Send[0].Text)
+	r := tap(t, s, s.Start(), "skip")
+	assert.Equal(t, "theme: skipped", r.Edit.Text)
+	assert.Equal(t, "Step 2 · 9 items left\nsolo?", r.Send[0].Text)
+	assert.Equal(t, []flow.Button{{Text: "back", Data: "abcd1234 2 b"}, {Text: "show results now", Data: "abcd1234 2 s"}}, r.Send[0].Buttons[len(r.Send[0].Buttons)-1])
 }
 
 func TestOtherNarrowsToTheRest(t *testing.T) {
@@ -187,19 +194,19 @@ func TestOtherNarrowsToTheRest(t *testing.T) {
 		label, _, _ := strings.Cut(row[0].Text, " (")
 		shown = append(shown, label)
 	}
-	r := tap(t, s, q, "other")
-	assert.Equal(t, "theme: other", r.Edit.Text)
+	r := tap(t, s, q, "none of these")
+	assert.Equal(t, "theme: none of these", r.Edit.Text)
 	assert.Equal(t, "No items left:\n  9 removed: does not match the answer to theme (none of "+strings.Join(shown, ", ")+")", r.Send[0].Text,
 		"every theme was shown, so other leaves nothing; the answer carries every shown key")
 }
 
 func TestEmptyAnswerOffersUndo(t *testing.T) {
 	s := flow.New("abcd1234", taste(t, nil))
-	r := tap(t, s, s.Start(), "no preference")
+	r := tap(t, s, s.Start(), "skip")
 	solo := r.Send[0]
-	require.Equal(t, "solo? (9 left)", solo.Text)
-	r = tap(t, s, solo, "other")
-	assert.Equal(t, "solo: other", r.Edit.Text)
+	require.Equal(t, "Step 2 · 9 items left\nsolo?", solo.Text)
+	r = tap(t, s, solo, "none of these")
+	assert.Equal(t, "solo: none of these", r.Edit.Text)
 	report := r.Send[0]
 	assert.Equal(t, "No items left:\n  9 removed: does not match the answer to solo (none of false, true)", report.Text)
 	assert.Equal(t, [][]flow.Button{{{Text: "Undo", Data: "abcd1234 3 u"}}}, report.Buttons)
@@ -249,8 +256,8 @@ func TestRebuildMatchesAFreshRun(t *testing.T) {
 
 func TestRebuildReplaysUndo(t *testing.T) {
 	s := flow.New("abcd1234", pair(t))
-	r := tap(t, s, s.Start(), "no preference")
-	r = tap(t, s, r.Send[0], "other")
+	r := tap(t, s, s.Start(), "skip")
+	r = tap(t, s, r.Send[0], "none of these")
 	require.True(t, strings.HasPrefix(r.Send[0].Text, "No items left:"))
 
 	rebuilt, err := s.Rebuild(taste(t, nil))
@@ -278,4 +285,57 @@ func TestRebuildAfterTheResults(t *testing.T) {
 	want := tap(t, fresh, fresh.Start(), "show results now").Send[0]
 	assert.Equal(t, want.Text, got.Text)
 	assert.Equal(t, flow.Button{Text: "why 1", Data: "abcd1234 w 0"}, got.Buttons[0][0])
+}
+
+// Back asks the last question again, with the answers before it still
+// applied, where the engine's Undo would skip its field.
+func TestBackAsksTheLastQuestionAgain(t *testing.T) {
+	s := flow.New("abcd1234", taste(t, nil))
+	first := s.Start()
+	r := tap(t, s, first, "sea")
+	second := r.Send[0]
+	require.Equal(t, "Step 2 · 4 items left\nsolo?", second.Text)
+
+	r = tap(t, s, second, "back")
+	assert.Equal(t, "solo: (back)", r.Edit.Text)
+	again := r.Send[0]
+	assert.Equal(t, first.Text, again.Text, "the first question again")
+	assert.Equal(t, texts(first), texts(again), "with the same buttons")
+	_, err := s.Tap(second.Buttons[0][0].Data)
+	require.ErrorIs(t, err, flow.ErrStale, "the question left by back is closed")
+
+	got := tap(t, s, again, "space").Send[0].Text
+	fresh := flow.New("ffff0000", taste(t, nil))
+	want := tap(t, fresh, fresh.Start(), "space").Send[0].Text
+	assert.True(t, strings.HasPrefix(want, "Top picks:"), want)
+	assert.Equal(t, want, got, "as if the answer taken back was never given")
+}
+
+// texts lists a screen's button texts, row by row.
+func texts(screen flow.Screen) [][]string {
+	var out [][]string
+	for _, row := range screen.Buttons {
+		var r []string
+		for _, b := range row {
+			r = append(r, b.Text)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// Back after an Undo takes back the answer that emptied the list too, so
+// its question is asked again rather than skipped.
+func TestBackAfterUndo(t *testing.T) {
+	s := flow.New("abcd1234", taste(t, nil))
+	first := s.Start()
+	r := tap(t, s, first, "none of these")
+	require.True(t, strings.HasPrefix(r.Send[0].Text, "No items left:"), r.Send[0].Text)
+	r = tap(t, s, r.Send[0], "Undo")
+	require.Equal(t, "Step 2 · 9 items left\nsolo?", r.Send[0].Text, "the Undo skipped theme")
+
+	r = tap(t, s, r.Send[0], "back")
+	assert.Equal(t, first.Text, r.Send[0].Text, "theme is asked again, not skipped")
+	r = tap(t, s, r.Send[0], "sea")
+	assert.Equal(t, "Step 2 · 4 items left\nsolo?", r.Send[0].Text)
 }
